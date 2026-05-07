@@ -86,7 +86,8 @@ void velReceived(const geometry_msgs::Twist::ConstPtr& msg) {
 }
 
 void rtcmReceived(const rtcm_msgs::Message& msg) {
-  if (!gps_service) return;
+  // Drop RTCM unless all three interfaces are connected
+  if (!gps_service || !gps_service_recording_1 || !gps_service_recording_2) return;
   static std::vector<uint8_t> rtcm_buffer{};
   static ros::Time last_time_sent{0};
   ros::Time now = ros::Time::now();
@@ -96,6 +97,9 @@ void rtcmReceived(const rtcm_msgs::Message& msg) {
   if (rtcm_buffer.size() < 1000 && (now - last_time_sent).toSec() < 0.2) return;
   last_time_sent = now;
   gps_service->SendRTCM(rtcm_buffer.data(), rtcm_buffer.size());
+  // Also relay RTCM to the new GPS serviecs.
+  gps_service_recording_1->SendRTCM(rtcm_buffer.data(), rtcm_buffer.size());
+  gps_service_recording_2->SendRTCM(rtcm_buffer.data(), rtcm_buffer.size());
   rtcm_buffer.clear();
 }
 
