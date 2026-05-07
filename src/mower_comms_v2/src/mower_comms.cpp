@@ -275,12 +275,12 @@ int main(int argc, char** argv) {
                                                       gps_port_index, absolute_coords);
   // Actually need to hard-code the same settings as on the firmware side, otherwise the firmware will refuse to star up
   // because it detects that settings mismatch.
-  gps_service_recording_1 = std::make_unique<GpsServiceInterface>(1001, ctx, gps_position_pub_recording_1, nmea_pub_recording_1,
-                                                      datum_lat, datum_long, datum_height, 460800, "NMEA",
-                                                      7, absolute_coords);
-  gps_service_recording_2 = std::make_unique<GpsServiceInterface>(1002, ctx, gps_position_pub_recording_2, nmea_pub_recording_2,
-                                                      datum_lat, datum_long, datum_height, 460800, "NMEA",
-                                                      8, absolute_coords);
+  gps_service_recording_1 =
+      std::make_unique<GpsServiceInterface>(1001, ctx, gps_position_pub_recording_1, nmea_pub_recording_1, datum_lat,
+                                            datum_long, datum_height, 460800, "NMEA", 7, absolute_coords);
+  gps_service_recording_2 =
+      std::make_unique<GpsServiceInterface>(1002, ctx, gps_position_pub_recording_2, nmea_pub_recording_2, datum_lat,
+                                            datum_long, datum_height, 460800, "NMEA", 8, absolute_coords);
 
   gps_service->Start();
   gps_service_recording_1->Start();
