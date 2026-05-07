@@ -39,8 +39,14 @@
 
 ros::Publisher status_pub;
 ros::Publisher nmea_pub;
+// Add two NMEA publishers (not that we need it for our experiment, but the service interface requires them)
+ros::Publisher nmea_pub_recording_1;
+ros::Publisher nmea_pub_recording_2;
 ros::Publisher power_pub;
 ros::Publisher gps_position_pub;
+// Add two more publishers for GPS position data (this is the data we're actually interested in)
+ros::Publisher gps_position_pub_recording_1;
+ros::Publisher gps_position_pub_recording_2;
 ros::Publisher status_left_esc_pub;
 ros::Publisher status_right_esc_pub;
 ros::Publisher emergency_pub;
@@ -250,7 +256,11 @@ int main(int argc, char** argv) {
   }
   ROS_INFO_STREAM("Datum: " << datum_lat << ", " << datum_long << ", " << datum_height);
   gps_position_pub = n.advertise<xbot_msgs::AbsolutePose>("ll/position/gps", 1);
+  gps_position_pub_recording_1 = n.advertise<xbot_msgs::AbsolutePose>("ll/position/gps1", 1);
+  gps_position_pub_recording_2 = n.advertise<xbot_msgs::AbsolutePose>("ll/position/gps2", 1);
   nmea_pub = n.advertise<nmea_msgs::Sentence>("ll/position/gps/nmea", 1);
+  nmea_pub_recording_1 = n.advertise<nmea_msgs::Sentence>("ll/position/gps1/nmea", 1);
+  nmea_pub_recording_2 = n.advertise<nmea_msgs::Sentence>("ll/position/gps2/nmea", 1);
   bool absolute_coords = true;
   paramNh.getParam("services/gps/absolute_coords", absolute_coords);
   gps_service = std::make_unique<GpsServiceInterface>(xbot::service_ids::GPS, ctx, gps_position_pub, nmea_pub,
