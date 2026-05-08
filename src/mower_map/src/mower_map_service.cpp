@@ -38,8 +38,12 @@
 #include "mower_map/SetNavPointSrv.h"
 
 // JSON for map storage
+#include <algorithm>
+#include <cmath>
+#include <cfloat>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <string>
@@ -60,6 +64,8 @@ const std::string LEGACY_MAP_FILE = "map.bag";
 // Forward declarations
 void saveMapToFile();
 void buildMap();
+bool normalizeAndOrderAreas();
+void updatePersistentMap();
 
 // Struct definitions for JSON serialization
 struct Point {
@@ -73,7 +79,9 @@ struct MapArea {
   std::string id;
   std::string name;
   std::string type;
-  bool active;
+  bool active = true;
+  bool mowing_enabled = true;
+  int mowing_order = 0;
   Polygon outline;
 };
 
@@ -92,8 +100,16 @@ struct MapData {
   std::vector<MapArea> getMowingAreas() {
     std::vector<MapArea> result;
     for (const auto& area : areas) {
-      if (area.type == "mow") result.push_back(area);
+      if (area.type != "mow") continue;
+      if (!area.active) continue;
+      if (!area.mowing_enabled) continue;
+      result.push_back(area);
     }
+
+    std::sort(result.begin(), result.end(), [](const MapArea& a, const MapArea& b) {
+      return a.mowing_order < b.mowing_order;
+    });
+
     return result;
   }
 
@@ -110,10 +126,21 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Point, x, y)
 
 void to_json(json& j, const MapArea& data) {
   j["id"] = data.id;
+
   json properties = json::object();
-  if (!data.name.empty()) properties["name"] = data.name;
   properties["type"] = data.type;
+  properties["name"] = data.name.empty() ? data.id : data.name;
+
+  if (data.type == "mow") {
+    properties["mowing_enabled"] = data.mowing_enabled;
+    properties["mowing_order"] = data.mowing_order;
+  } else {
+    properties["mowing_enabled"] = false;
+    properties["mowing_order"] = 0;
+  }
+
   if (!data.active) properties["active"] = data.active;
+
   j["properties"] = properties;
   j["outline"] = data.outline;
 }
@@ -121,9 +148,19 @@ void to_json(json& j, const MapArea& data) {
 void from_json(const json& j, MapArea& data) {
   j.at("id").get_to(data.id);
   const auto& properties = j.value("properties", json::object());
-  data.name = properties.value("name", "");
+
   data.type = properties.value("type", "draft");
   data.active = properties.value("active", true);
+
+  if (properties.contains("name") && !properties["name"].is_null()) {
+    data.name = properties["name"].get<std::string>();
+  } else {
+    data.name = "";
+  }
+
+  data.mowing_enabled = properties.value("mowing_enabled", data.type == "mow");
+  data.mowing_order = properties.value("mowing_order", 0);
+
   j.at("outline").get_to(data.outline);
 }
 
@@ -194,9 +231,8 @@ xbot_rpc::RpcProvider rpc_provider("mower_map_service", {{
     } catch (const std::exception& e) {
       throw xbot_rpc::RpcException(xbot_rpc::RpcError::ERROR_INVALID_PARAMS, "Invalid map: " + std::string(e.what()));
     }
-    saveMapToFile();
+    updatePersistentMap();
     ROS_INFO_STREAM("Loaded " << map_data.areas.size() << " areas via RPC and saved to file");
-    buildMap();
     return "Successfully stored map (" + std::to_string(map_data.areas.size()) + " areas)";
   }),
 }});
@@ -236,6 +272,8 @@ MapArea mowerMapAreaToInternal(const geometry_msgs::Polygon& area, const std::st
   result.type = type;
   result.name = name;
   result.active = true;
+  result.mowing_enabled = (type == "mow");
+  result.mowing_order = 0;
   result.outline = geometryPolygonToInternal(area);
   return result;
 }
@@ -259,6 +297,162 @@ grid_map::Polygon internalPolygonToGridMap(const Polygon& poly) {
     result.addVertex(grid_map::Position(point.x, point.y));
   }
   return result;
+}
+
+double squaredDistance(const Point& a, const Point& b) {
+  const double dx = a.x - b.x;
+  const double dy = a.y - b.y;
+  return dx * dx + dy * dy;
+}
+
+Point polygonCentroid(const Polygon& poly) {
+  if (poly.empty()) return {0.0, 0.0};
+
+  double x = 0.0;
+  double y = 0.0;
+  for (const auto& p : poly) {
+    x += p.x;
+    y += p.y;
+  }
+
+  return {x / poly.size(), y / poly.size()};
+}
+
+bool pointInPolygon(const Point& point, const Polygon& poly) {
+  if (poly.size() < 3) return false;
+
+  bool inside = false;
+  for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++) {
+    const Point& pi = poly[i];
+    const Point& pj = poly[j];
+
+    const bool intersects = ((pi.y > point.y) != (pj.y > point.y)) &&
+                            (point.x < (pj.x - pi.x) * (point.y - pi.y) / ((pj.y - pi.y) + 1e-12) + pi.x);
+    if (intersects) inside = !inside;
+  }
+
+  return inside;
+}
+
+double distancePointToSegmentSquared(const Point& point, const Point& a, const Point& b) {
+  const double dx = b.x - a.x;
+  const double dy = b.y - a.y;
+  const double length_sq = dx * dx + dy * dy;
+
+  if (length_sq <= 1e-12) return squaredDistance(point, a);
+
+  double t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / length_sq;
+  t = std::max(0.0, std::min(1.0, t));
+
+  const Point projection{a.x + t * dx, a.y + t * dy};
+  return squaredDistance(point, projection);
+}
+
+double distancePointToPolygonSquared(const Point& point, const Polygon& poly) {
+  if (poly.empty()) return std::numeric_limits<double>::infinity();
+  if (pointInPolygon(point, poly)) return 0.0;
+
+  double best = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < poly.size(); ++i) {
+    const Point& a = poly[i];
+    const Point& b = poly[(i + 1) % poly.size()];
+    best = std::min(best, distancePointToSegmentSquared(point, a, b));
+  }
+
+  return best;
+}
+
+double distancePolygonsSquared(const Polygon& a, const Polygon& b) {
+  if (a.empty() || b.empty()) return std::numeric_limits<double>::infinity();
+
+  double best = std::numeric_limits<double>::infinity();
+
+  for (const auto& p : a) {
+    best = std::min(best, distancePointToPolygonSquared(p, b));
+  }
+  for (const auto& p : b) {
+    best = std::min(best, distancePointToPolygonSquared(p, a));
+  }
+
+  return best;
+}
+
+std::vector<MapArea*> calculateOrderedMowingAreas() {
+  std::vector<MapArea*> candidates;
+  for (auto& area : map_data.areas) {
+    if (area.type == "mow" && !area.outline.empty()) {
+      candidates.push_back(&area);
+    }
+  }
+
+  std::vector<MapArea*> ordered;
+  if (candidates.empty()) return ordered;
+
+  if (map_data.docking_stations.empty()) {
+    ROS_WARN_STREAM("No docking station available. Falling back to current mowing area order.");
+    return candidates;
+  }
+
+  Point current_position = map_data.docking_stations.front().position;
+  MapArea* current_area = nullptr;
+
+  while (!candidates.empty()) {
+    auto best_it = std::min_element(candidates.begin(), candidates.end(), [&](const MapArea* a, const MapArea* b) {
+      double da;
+      double db;
+
+      if (current_area == nullptr) {
+        da = distancePointToPolygonSquared(current_position, a->outline);
+        db = distancePointToPolygonSquared(current_position, b->outline);
+      } else {
+        da = distancePolygonsSquared(current_area->outline, a->outline);
+        db = distancePolygonsSquared(current_area->outline, b->outline);
+      }
+
+      return da < db;
+    });
+
+    current_area = *best_it;
+    current_position = polygonCentroid(current_area->outline);
+    ordered.push_back(current_area);
+    candidates.erase(best_it);
+  }
+
+  return ordered;
+}
+
+bool normalizeAndOrderAreas() {
+  bool changed = false;
+
+  for (auto& area : map_data.areas) {
+    if (area.name.empty()) {
+      area.name = area.id;
+      changed = true;
+    }
+
+    if (area.type != "mow") {
+      if (area.mowing_enabled != false) {
+        area.mowing_enabled = false;
+        changed = true;
+      }
+
+      if (area.mowing_order != 0) {
+        area.mowing_order = 0;
+        changed = true;
+      }
+    }
+  }
+
+  int order = 10;
+  for (auto* area : calculateOrderedMowingAreas()) {
+    if (area->mowing_order != order) {
+      area->mowing_order = order;
+      changed = true;
+    }
+    order += 10;
+  }
+
+  return changed;
 }
 
 /**
@@ -516,6 +710,16 @@ void saveMapToFile() {
 }
 
 /**
+ * Normalize persistent map data, save it and rebuild all derived map outputs.
+ * Use this after changes that should be stored in map.json.
+ */
+void updatePersistentMap() {
+  normalizeAndOrderAreas();
+  saveMapToFile();
+  buildMap();
+}
+
+/**
  * Load the map from a JSON file and build a map.
  */
 void readMapFromFile() {
@@ -545,8 +749,7 @@ bool addMowingArea(mower_map::AddMowingAreaSrvRequest& req, mower_map::AddMowing
     map_data.areas.push_back(mowerMapAreaToInternal(obstacle, "obstacle", ""));
   }
 
-  saveMapToFile();
-  buildMap();
+  updatePersistentMap();
   return true;
 }
 
@@ -559,7 +762,9 @@ bool getMowingArea(mower_map::GetMowingAreaSrvRequest& req, mower_map::GetMowing
     return false;
   }
 
-  res.area = internalMapAreaToMower(mowing_areas[req.index]);
+  const auto& selected_area = mowing_areas[req.index];
+  ROS_INFO_STREAM("Selected mowing area: " << selected_area.name << " order=" << selected_area.mowing_order);
+  res.area = internalMapAreaToMower(selected_area);
 
   for (const auto& area : map_data.areas) {
     if (!area.active || area.type != "obstacle") continue;
@@ -586,8 +791,7 @@ bool setDockingPoint(mower_map::SetDockingPointSrvRequest& req, mower_map::SetDo
                                        .position = {req.docking_pose.position.x, req.docking_pose.position.y},
                                        .heading = heading});
 
-  saveMapToFile();
-  buildMap();
+  updatePersistentMap();
 
   return true;
 }
@@ -640,8 +844,7 @@ bool clearMap(mower_map::ClearMapSrvRequest& req, mower_map::ClearMapSrvResponse
 
   map_data.clear();
 
-  saveMapToFile();
-  buildMap();
+  updatePersistentMap();
   return true;
 }
 
@@ -724,6 +927,7 @@ void convertLegacyMapToJson() {
   bag.close();
 
   // Save the converted data to JSON file
+  normalizeAndOrderAreas();
   saveMapToFile();
 
   ROS_INFO_STREAM("Successfully converted legacy map to JSON with "
@@ -746,6 +950,9 @@ int main(int argc, char** argv) {
   } else {
     readMapFromFile();
   }
+
+  normalizeAndOrderAreas();
+  saveMapToFile();
 
   buildMap();
 
