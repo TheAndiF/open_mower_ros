@@ -40,5 +40,5 @@ jobs:
           platforms: linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:test
+            ghcr.io/theandif/open_mower_ros:latest
+            ghcr.io/theandif/open_mower_ros:test
