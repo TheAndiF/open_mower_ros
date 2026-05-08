@@ -15,12 +15,14 @@
 
 GpsServiceInterface::GpsServiceInterface(uint16_t service_id, const xbot::serviceif::Context& ctx,
                                          const ros::Publisher& absolute_pose_publisher,
-                                         const ros::Publisher& nmea_publisher, double datum_lat, double datum_long,
-                                         double datum_height, uint32_t baud_rate, const std::string& protocol,
-                                         uint8_t port_index, bool absolute_coords)
+                                         const ros::Publisher& nmea_publisher,
+                                         const ros::Publisher* optional_absolute_pose_publisher2, double datum_lat,
+                                         double datum_long, double datum_height, uint32_t baud_rate,
+                                         const std::string& protocol, uint8_t port_index, bool absolute_coords)
     : GpsServiceInterfaceBase(service_id, ctx),
       absolute_pose_publisher_(absolute_pose_publisher),
       nmea_publisher_(nmea_publisher),
+      optional_absolute_pose_publisher2_(optional_absolute_pose_publisher2),
       baud_rate_(baud_rate),
       protocol_(protocol),
       port_index_(port_index),
@@ -175,4 +177,7 @@ void GpsServiceInterface::OnVehicleHeadingAndAccuracyChanged(const double* new_v
 
 void GpsServiceInterface::OnTransactionEnd() {
   absolute_pose_publisher_.publish(pose_msg_);
+  if (optional_absolute_pose_publisher2_) {
+    optional_absolute_pose_publisher2_->publish(pose_msg_);
+  }
 }
