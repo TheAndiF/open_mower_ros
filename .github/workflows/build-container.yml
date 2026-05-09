@@ -134,9 +134,9 @@ jobs:
           # test   = Tag, den der Mower aktuell verwendet
           # Datum  = feste, nachvollziehbare Version
           tags: |
-            ghcr.io/theandif/open_mower_ros:latest
-            ghcr.io/theandif/open_mower_ros:test
-            ghcr.io/theandif/open_mower_ros:${{ env.BUILD_DATE }}
+            ghcr.io/theandif/open_mower_ros:taf_latest
+            ghcr.io/theandif/open_mower_ros:taf_test
+            ghcr.io/theandif/open_mower_ros:taf_${{ env.BUILD_DATE }}
 
       # Kompletter Build ohne Cache.
       #
@@ -178,6 +178,6 @@ jobs:
 
           # Auch der komplette Neubuild bekommt dieselben drei Tags.
           tags: |
-            ghcr.io/theandif/open_mower_ros:latest
-            ghcr.io/theandif/open_mower_ros:test
-            ghcr.io/theandif/open_mower_ros:${{ env.BUILD_DATE }}
+            ghcr.io/theandif/open_mower_ros:taf_latest
+            ghcr.io/theandif/open_mower_ros:taf_test
+            ghcr.io/theandif/open_mower_ros:taf_${{ env.BUILD_DATE }}
