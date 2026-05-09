@@ -377,6 +377,72 @@ double distancePolygonsSquared(const Polygon& a, const Polygon& b) {
   return best;
 }
 
+// Two areas are considered connected when their polygons touch/overlap or are closer than this tolerance.
+// The tolerance is important because map polygons rarely touch exactly due to GPS/float noise.
+constexpr double MOWING_ORDER_CONNECTION_TOLERANCE = 0.30;  // meters
+
+bool polygonsConnected(const Polygon& a, const Polygon& b,
+                       double tolerance = MOWING_ORDER_CONNECTION_TOLERANCE) {
+  if (a.empty() || b.empty()) return false;
+  return distancePolygonsSquared(a, b) <= tolerance * tolerance;
+}
+
+bool isActiveNavigationArea(const MapArea& area) {
+  return area.active && area.type == "nav" && !area.outline.empty();
+}
+
+/**
+ * Returns true if two mowing areas are reachable from each other for ordering purposes.
+ *
+ * Reachable means:
+ *  - the mowing areas touch/overlap directly within the configured tolerance, or
+ *  - they are connected through one or more active nav areas.
+ *
+ * Nav areas are not mowed and keep mowing_order=0, but they can act as corridors between mowing areas.
+ */
+bool mowingAreasConnectedDirectlyOrViaNav(const MapArea& from, const MapArea& to) {
+  if (polygonsConnected(from.outline, to.outline)) return true;
+
+  std::vector<const MapArea*> nav_areas;
+  for (const auto& area : map_data.areas) {
+    if (isActiveNavigationArea(area)) {
+      nav_areas.push_back(&area);
+    }
+  }
+
+  if (nav_areas.empty()) return false;
+
+  std::vector<bool> visited(nav_areas.size(), false);
+  std::vector<size_t> stack;
+
+  for (size_t i = 0; i < nav_areas.size(); ++i) {
+    if (polygonsConnected(from.outline, nav_areas[i]->outline)) {
+      visited[i] = true;
+      stack.push_back(i);
+    }
+  }
+
+  while (!stack.empty()) {
+    const size_t current_index = stack.back();
+    stack.pop_back();
+
+    const MapArea* current_nav = nav_areas[current_index];
+    if (polygonsConnected(current_nav->outline, to.outline)) {
+      return true;
+    }
+
+    for (size_t i = 0; i < nav_areas.size(); ++i) {
+      if (visited[i]) continue;
+      if (!polygonsConnected(current_nav->outline, nav_areas[i]->outline)) continue;
+
+      visited[i] = true;
+      stack.push_back(i);
+    }
+  }
+
+  return false;
+}
+
 std::vector<MapArea*> calculateOrderedMowingAreas() {
   std::vector<MapArea*> candidates;
   for (auto& area : map_data.areas) {
@@ -397,7 +463,28 @@ std::vector<MapArea*> calculateOrderedMowingAreas() {
   MapArea* current_area = nullptr;
 
   while (!candidates.empty()) {
-    auto best_it = std::min_element(candidates.begin(), candidates.end(), [&](const MapArea* a, const MapArea* b) {
+    std::vector<MapArea*> selection_pool;
+
+    if (current_area == nullptr) {
+      // First mowing area: start from the docking station and choose the closest mowing area.
+      selection_pool = candidates;
+    } else {
+      // Following mowing areas: only choose areas that are directly connected or reachable via nav areas.
+      for (auto* candidate : candidates) {
+        if (mowingAreasConnectedDirectlyOrViaNav(*current_area, *candidate)) {
+          selection_pool.push_back(candidate);
+        }
+      }
+
+      if (selection_pool.empty()) {
+        ROS_WARN_STREAM("No directly/nav-connected mowing area found after area '"
+                        << current_area->name << "' (" << current_area->id
+                        << "). Falling back to closest remaining mowing area.");
+        selection_pool = candidates;
+      }
+    }
+
+    auto best_it = std::min_element(selection_pool.begin(), selection_pool.end(), [&](const MapArea* a, const MapArea* b) {
       double da;
       double db;
 
@@ -415,7 +502,11 @@ std::vector<MapArea*> calculateOrderedMowingAreas() {
     current_area = *best_it;
     current_position = polygonCentroid(current_area->outline);
     ordered.push_back(current_area);
-    candidates.erase(best_it);
+
+    auto candidate_it = std::find(candidates.begin(), candidates.end(), current_area);
+    if (candidate_it != candidates.end()) {
+      candidates.erase(candidate_it);
+    }
   }
 
   return ordered;
