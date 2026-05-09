@@ -1,33 +1,92 @@
+# Name des GitHub-Actions-Workflows.
+# Dieser Name wird später im GitHub-Reiter "Actions" angezeigt.
+# BS_...            = schneller Build mit Cache
+# BL_...            = kompletter Build ohne Cache
+# manueller Start   = kompletter Build ohne Cache
+# alles andere       = kein Build-Job
 name: Build container
 
+# Wann der Workflow grundsätzlich gestartet wird.
 on:
+  # Wird bei jedem git push ausgelöst.
+  # Ob dann wirklich gebaut wird, entscheidet weiter unten die if-Bedingung.
   push:
+
+  # Erlaubt zusätzlich das manuelle Starten über GitHub oder per:
+  # gh workflow run build-container.yml
+  #
+  # Manueller Start bedeutet in dieser Datei:
+  # kompletter Build ohne Cache.
   workflow_dispatch:
 
+# Rechte für den Workflow.
+# contents: read  = Repository lesen
+# packages: write = Docker-Image nach GHCR pushen
 permissions:
   contents: read
   packages: write
 
 jobs:
   build:
+    # Der Job läuft nur in diesen Fällen:
+    #
+    # 1. Manueller Start:
+    #    gh workflow run build-container.yml
+    #    -> kompletter Build ohne Cache
+    #
+    # 2. Commit-Nachricht beginnt mit BS_
+    #    Beispiel:
+    #    git commit -m "BS_ kleine Änderung"
+    #    -> Build mit Cache / Wiederverwendung
+    #
+    # 3. Commit-Nachricht beginnt mit BL_
+    #    Beispiel:
+    #    git commit -m "BL_ kompletter Neubuild"
+    #    -> Build ohne Cache / alles neu
+    #
+    # Alle anderen Pushes starten zwar den Workflow,
+    # aber dieser Build-Job wird übersprungen.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.head_commit.message, 'BS_') ||
+      startsWith(github.event.head_commit.message, 'BL_')
+
+    # Der Build läuft auf einem GitHub-Server mit Ubuntu.
     runs-on: ubuntu-latest
 
     steps:
+      # Repository auschecken.
+      # submodules: recursive ist wichtig, weil OpenMower Submodule verwendet.
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
+      # Erzeugt einen Datums-/Zeit-Tag für das Docker-Image.
+      # Beispiel:
+      # ghcr.io/theandif/open_mower_ros:2026-05-09-1430
+      #
+      # Zeit ist UTC, nicht lokale deutsche Zeit.
       - name: Set build date
         shell: bash
         run: echo "BUILD_DATE=$(date -u +'%Y-%m-%d-%H%M')" >> $GITHUB_ENV
 
+      # QEMU wird benötigt, damit auf dem GitHub-Server
+      # ein ARM64-Image gebaut werden kann.
+      # Der Mower benötigt linux/arm64.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      # Docker Buildx wird für moderne Docker-Builds verwendet,
+      # besonders für Plattformen wie linux/arm64.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Anmeldung bei GitHub Container Registry.
+      # GHCR ist der Speicherort für dein fertiges Docker-Image.
+      #
+      # Ergebnis landet später z. B. hier:
+      # ghcr.io/theandif/open_mower_ros:test
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -35,13 +94,89 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      # Schneller Build mit Cache.
+      #
+      # Wird nur ausgeführt bei:
+      # - Commit-Nachricht beginnt mit BS_
+      #
+      # Dieser Build versucht, möglichst viele alte Docker-Schichten
+      # wiederzuverwenden. Das ist die normale Variante für kleine Änderungen.
+      #
+      # Beispiel:
+      # git commit -m "BS_ Änderung Mählogik"
+      # git push
+      - name: Build and push Docker image with cache
+        if: startsWith(github.event.head_commit.message, 'BS_')
         uses: docker/build-push-action@v6
         with:
+          # Build-Kontext ist das Repository-Hauptverzeichnis.
           context: .
+
+          # OpenMower-Dockerfile liegt nicht im Hauptverzeichnis,
+          # sondern im Unterordner docker.
           file: ./docker/Dockerfile
+
+          # Zielplattform für den Mower.
           platforms: linux/arm64
+
+          # Image nach dem Build nach GHCR hochladen.
           push: true
+
+          # Cache aus vorherigen GitHub-Actions-Builds verwenden.
+          cache-from: type=gha
+
+          # Neuen Cache für spätere Builds speichern.
+          cache-to: type=gha,mode=max
+
+          # Ein Build bekommt drei Tags:
+          #
+          # latest = letzter erfolgreicher Build
+          # test   = Tag, den der Mower aktuell verwendet
+          # Datum  = feste, nachvollziehbare Version
+          tags: |
+            ghcr.io/theandif/open_mower_ros:latest
+            ghcr.io/theandif/open_mower_ros:test
+            ghcr.io/theandif/open_mower_ros:${{ env.BUILD_DATE }}
+
+      # Kompletter Build ohne Cache.
+      #
+      # Wird ausgeführt bei:
+      # - Commit-Nachricht beginnt mit BL_
+      # - manuellem Start über GitHub
+      # - manuellem Start per:
+      #   gh workflow run build-container.yml
+      #
+      # Diese Variante baut alles neu auf und verwendet keine alten
+      # Docker-Schichten. Das dauert länger, ist aber sinnvoll, wenn du
+      # vermutest, dass der Cache veraltete Inhalte verwendet.
+      #
+      # Beispiel per Commit:
+      # git commit -m "BL_ kompletter Neubuild"
+      # git push
+      #
+      # Beispiel manuell:
+      # gh workflow run build-container.yml
+      - name: Build and push Docker image without cache
+        if: startsWith(github.event.head_commit.message, 'BL_') || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          # Build-Kontext ist das Repository-Hauptverzeichnis.
+          context: .
+
+          # OpenMower-Dockerfile liegt im Unterordner docker.
+          file: ./docker/Dockerfile
+
+          # Zielplattform für den Mower.
+          platforms: linux/arm64
+
+          # Image nach dem Build nach GHCR hochladen.
+          push: true
+
+          # Cache komplett deaktivieren.
+          # Dadurch wird alles neu gebaut.
+          no-cache: true
+
+          # Auch der komplette Neubuild bekommt dieselben drei Tags.
           tags: |
             ghcr.io/theandif/open_mower_ros:latest
             ghcr.io/theandif/open_mower_ros:test
