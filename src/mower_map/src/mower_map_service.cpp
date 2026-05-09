@@ -107,6 +107,7 @@ struct MapData {
       if (area.type != "mow") continue;
       if (!area.active) continue;
       if (!area.mowing_enabled) continue;
+      if (area.mowing_order <= 0) continue;
       result.push_back(area);
     }
 
@@ -448,10 +449,36 @@ bool mowingAreasConnectedDirectlyOrViaNav(const MapArea& from, const MapArea& to
   return false;
 }
 
+std::vector<MapArea*> getConnectionAnchorsByPriority(MapArea* current_area,
+                                                     const std::vector<MapArea*>& ordered) {
+  std::vector<MapArea*> anchors;
+
+  if (current_area != nullptr) {
+    anchors.push_back(current_area);
+  }
+
+  std::vector<MapArea*> previous_areas;
+  for (auto* previous_area : ordered) {
+    if (previous_area == nullptr) continue;
+    if (previous_area == current_area) continue;
+    previous_areas.push_back(previous_area);
+  }
+
+  if (current_area != nullptr) {
+    std::sort(previous_areas.begin(), previous_areas.end(), [&](const MapArea* a, const MapArea* b) {
+      return distancePolygonsSquared(current_area->outline, a->outline) <
+             distancePolygonsSquared(current_area->outline, b->outline);
+    });
+  }
+
+  anchors.insert(anchors.end(), previous_areas.begin(), previous_areas.end());
+  return anchors;
+}
+
 std::vector<MapArea*> calculateOrderedMowingAreas() {
   std::vector<MapArea*> candidates;
   for (auto& area : map_data.areas) {
-    if (area.type == "mow" && !area.outline.empty()) {
+    if (area.type == "mow" && area.active && area.mowing_enabled && !area.outline.empty()) {
       candidates.push_back(&area);
     }
   }
@@ -460,52 +487,62 @@ std::vector<MapArea*> calculateOrderedMowingAreas() {
   if (candidates.empty()) return ordered;
 
   if (map_data.docking_stations.empty()) {
-    ROS_WARN_STREAM("No docking station available. Falling back to current mowing area order.");
+    ROS_WARN_STREAM("No docking station available. Falling back to current enabled mowing area order.");
     return candidates;
   }
 
-  Point current_position = map_data.docking_stations.front().position;
+  const Point docking_position = map_data.docking_stations.front().position;
   MapArea* current_area = nullptr;
 
   while (!candidates.empty()) {
-    std::vector<MapArea*> selection_pool;
+    MapArea* next_area = nullptr;
 
-    if (current_area == nullptr) {
+    if (ordered.empty()) {
       // First mowing area: start from the docking station and choose the closest mowing area.
-      selection_pool = candidates;
+      auto best_it = std::min_element(candidates.begin(), candidates.end(), [&](const MapArea* a, const MapArea* b) {
+        return distancePointToPolygonSquared(docking_position, a->outline) <
+               distancePointToPolygonSquared(docking_position, b->outline);
+      });
+
+      next_area = *best_it;
     } else {
-      // Following mowing areas: prefer only areas directly connected or reachable via nav areas.
-      for (auto* candidate : candidates) {
-        if (mowingAreasConnectedDirectlyOrViaNav(*current_area, *candidate)) {
-          selection_pool.push_back(candidate);
+      // Next areas are searched by anchor priority:
+      // 1. first from the current / last ordered mowing area,
+      // 2. then from the already ordered mowing areas nearest to the current area, one by one.
+      // A candidate is only valid for an anchor if it is connected to that anchor directly
+      // or through active nav areas. If no anchor has a connected candidate, ordering stops.
+      const auto anchors = getConnectionAnchorsByPriority(current_area, ordered);
+
+      for (const auto* anchor : anchors) {
+        if (anchor == nullptr) continue;
+
+        std::vector<MapArea*> selection_pool;
+        for (auto* candidate : candidates) {
+          if (mowingAreasConnectedDirectlyOrViaNav(*anchor, *candidate)) {
+            selection_pool.push_back(candidate);
+          }
         }
+
+        if (selection_pool.empty()) continue;
+
+        auto best_it = std::min_element(selection_pool.begin(), selection_pool.end(), [&](const MapArea* a, const MapArea* b) {
+          return distancePolygonsSquared(anchor->outline, a->outline) <
+                 distancePolygonsSquared(anchor->outline, b->outline);
+        });
+
+        next_area = *best_it;
+        break;
       }
 
-      if (selection_pool.empty()) {
-        ROS_WARN_STREAM("No directly/nav-connected mowing area found after area '"
-                        << current_area->name << "' (" << current_area->id
-                        << "). Falling back to closest remaining mowing area.");
-        selection_pool = candidates;
+      if (next_area == nullptr) {
+        ROS_WARN_STREAM("Stopping mowing order calculation: " << candidates.size()
+                        << " enabled mowing area(s) are not connected to the current mowing area "
+                        << "or to any previously ordered mowing area directly or through active nav areas.");
+        break;
       }
     }
 
-    auto best_it = std::min_element(selection_pool.begin(), selection_pool.end(), [&](const MapArea* a, const MapArea* b) {
-      double da;
-      double db;
-
-      if (current_area == nullptr) {
-        da = distancePointToPolygonSquared(current_position, a->outline);
-        db = distancePointToPolygonSquared(current_position, b->outline);
-      } else {
-        da = distancePolygonsSquared(current_area->outline, a->outline);
-        db = distancePolygonsSquared(current_area->outline, b->outline);
-      }
-
-      return da < db;
-    });
-
-    current_area = *best_it;
-    current_position = polygonCentroid(current_area->outline);
+    current_area = next_area;
     ordered.push_back(current_area);
 
     auto candidate_it = std::find(candidates.begin(), candidates.end(), current_area);
@@ -576,6 +613,15 @@ bool hasValidMowingOrder() {
 bool recalculateMowingOrder() {
   bool changed = false;
 
+  // Clear all existing order values first. Areas that cannot be connected to the ordered
+  // component must not keep stale mowing_order values from an older map state.
+  for (auto& area : map_data.areas) {
+    if (area.mowing_order != 0) {
+      area.mowing_order = 0;
+      changed = true;
+    }
+  }
+
   int order = 10;
   for (auto* area : calculateOrderedMowingAreas()) {
     if (area->mowing_order != order) {
@@ -583,15 +629,6 @@ bool recalculateMowingOrder() {
       changed = true;
     }
     order += 10;
-  }
-
-  // Ensure non-mowing areas never keep stale order values.
-  for (auto& area : map_data.areas) {
-    if (area.type == "mow") continue;
-    if (area.mowing_order != 0) {
-      area.mowing_order = 0;
-      changed = true;
-    }
   }
 
   return changed;
