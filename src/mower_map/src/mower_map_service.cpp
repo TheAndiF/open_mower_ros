@@ -969,8 +969,10 @@ bool getMowingArea(mower_map::GetMowingAreaSrvRequest& req, mower_map::GetMowing
   }
 
   const auto& selected_area = mowing_areas[req.index];
-  ROS_INFO_STREAM("Selected mowing area: " << selected_area.name << " order=" << selected_area.mowing_order);
+  ROS_INFO_STREAM("Selected mowing area: " << selected_area.name << " id=" << selected_area.id
+                                            << " order=" << selected_area.mowing_order);
   res.area = internalMapAreaToMower(selected_area);
+  res.area_id = selected_area.id;
 
   for (const auto& area : map_data.areas) {
     if (!area.active || area.type != "obstacle") continue;

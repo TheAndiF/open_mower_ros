@@ -485,6 +485,7 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
     j["current_state"] = msg->current_state;
     j["current_sub_state"] = msg->current_sub_state;
     j["current_area"] = msg->current_area;
+    j["current_area_id"] = msg->current_area_id;
     j["current_path"] = msg->current_path;
     j["current_path_index"] = msg->current_path_index;
     j["emergency"] = msg->emergency;

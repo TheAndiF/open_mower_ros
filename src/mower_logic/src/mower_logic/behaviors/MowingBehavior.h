@@ -39,6 +39,7 @@ class MowingBehavior : public Behavior {
   ros::Time last_checkpoint;
   int currentMowingPath;
   int currentMowingArea;
+  std::string currentAreaId;
   int currentMowingPathIndex;
   std::string currentMowingPlanDigest;
   double currentMowingAngleIncrementSum;
@@ -77,6 +78,8 @@ class MowingBehavior : public Behavior {
   uint8_t get_state() override;
 
   int16_t get_current_area();
+
+  std::string get_current_area_id();
 
   int16_t get_current_path();
 

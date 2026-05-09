@@ -331,6 +331,7 @@ void updateUI(const ros::TimerEvent& timer_event) {
   if (currentBehavior == &MowingBehavior::INSTANCE) {
     try {
       high_level_status.current_area = MowingBehavior::INSTANCE.get_current_area();
+      high_level_status.current_area_id = MowingBehavior::INSTANCE.get_current_area_id();
     } catch (const std::runtime_error& re) {
       // specific handling for runtime_error
       ROS_ERROR_STREAM("Error getting current area: " << re.what());
@@ -347,6 +348,7 @@ void updateUI(const ros::TimerEvent& timer_event) {
     }
   } else {
     high_level_status.current_area = -1;
+    high_level_status.current_area_id = "";
     high_level_status.current_path = -1;
     high_level_status.current_path_index = -1;
   }

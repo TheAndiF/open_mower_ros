@@ -13,6 +13,7 @@ uint8 state
 string state_name
 string sub_state_name
 int16 current_area
+string current_area_id
 int16 current_path
 int16 current_path_index
 float32 gps_quality_percent

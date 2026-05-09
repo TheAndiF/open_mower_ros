@@ -110,6 +110,7 @@ void MowingBehavior::exit() {
 void MowingBehavior::reset() {
   currentMowingPaths.clear();
   currentMowingArea = 0;
+  currentAreaId.clear();
   currentMowingPath = 0;
   currentMowingPathIndex = 0;
   // increase cumulative mowing angle offset increment
@@ -152,10 +153,14 @@ bool MowingBehavior::create_mowing_plan(int area_index) {
   mapSrv.request.index = area_index;
   if (!mapClient.call(mapSrv)) {
     ROS_ERROR_STREAM("MowingBehavior: Error loading mowing area");
+    currentAreaId.clear();
     return false;
   }
 
+  currentAreaId = mapSrv.response.area_id;
+
   if (mapSrv.response.area.area.points.empty()) {
+    currentAreaId.clear();
     ROS_INFO_STREAM("MowingBehavior: Skipping inactive mowing area");
     return true;
   }
@@ -613,6 +618,10 @@ int16_t MowingBehavior::get_current_area() {
   return currentMowingArea;
 }
 
+std::string MowingBehavior::get_current_area_id() {
+  return currentAreaId;
+}
+
 int16_t MowingBehavior::get_current_path() {
   return currentMowingPath;
 }
@@ -699,6 +708,7 @@ bool MowingBehavior::restore_checkpoint() {
   } catch (rosbag::BagIOException& e) {
     // Checkpoint does not exist or is corrupt, start at the very beginning
     currentMowingArea = 0;
+    currentAreaId.clear();
     currentMowingPath = 0;
     currentMowingPathIndex = 0;
     currentMowingAngleIncrementSum = 0;

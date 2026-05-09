@@ -115,6 +115,7 @@ void high_level_status(const mower_msgs::HighLevelStatus::ConstPtr& msg) {
   state.current_state = msg->state_name;
   state.current_sub_state = msg->sub_state_name;
   state.current_area = msg->current_area;
+  state.current_area_id = msg->current_area_id;
   state.current_path = msg->current_path;
   state.current_path_index = msg->current_path_index;
   state.battery_percentage = msg->battery_percent;
