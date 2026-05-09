@@ -220,5 +220,27 @@
         "description": "Required battery state before automatically starting a mission. full uses battery_full_threshold, sufficient uses battery_sufficient_threshold."
       }
     }
+  },
+  "suspension": {
+    "current": {
+      "enabled": false,
+      "mode": "none",
+      "started_at": null,
+      "pause_until": null
+    },
+    "options": {
+      "pause_one_day": {
+        "type": "pause_1_day",
+        "minimum_hours": 24,
+        "until_next_midnight": true,
+        "enabled": true
+      },
+      "pause_three_days": {
+        "type": "pause_3_days",
+        "minimum_hours": 72,
+        "until_next_midnight": true,
+        "enabled": true
+      }
+    }
   }
 }

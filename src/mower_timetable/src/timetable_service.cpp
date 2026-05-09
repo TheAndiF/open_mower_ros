@@ -16,10 +16,13 @@
 #include <ctime>
 #include <cctype>
 #include <fstream>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 // RPC, used analog to mower_map_service. This is optional for the first file based test,
 // but gives us a ready JSON input path for the later MQTT/RPC wiring.
@@ -29,7 +32,7 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr const char* DEFAULT_TIMETABLE_FILE = "/srv/ros/timetable.json";
+constexpr const char* DEFAULT_TIMETABLE_FILE = "/data/ros/timetable.json";
 
 struct TimetableEntry {
   std::string id;
@@ -56,6 +59,11 @@ struct TimetableConfig {
   bool auto_start = true;
   std::string required_battery_state = "full";
   int minimum_remaining_window_minutes = 30;
+  bool suspension_enabled = false;
+  std::string suspension_mode = "none";
+  std::string suspension_started_at;
+  std::string suspension_pause_until;
+  std::time_t suspension_pause_until_time = 0;
   std::vector<TimetableEntry> entries;
 };
 
@@ -65,6 +73,10 @@ struct Evaluation {
   bool active_window = false;
   bool start_allowed = false;
   bool mission_trigger_allowed = false;
+  bool auto_mowing_time = false;
+  bool suspended = false;
+  std::string suspension_mode = "none";
+  std::string suspended_until;
   std::string active_entry_id;
   std::string active_day;
   std::string active_start;
@@ -134,6 +146,82 @@ bool systemTimeLooksValid() {
   return (local_tm.tm_year + 1900) >= 2023;
 }
 
+std::string parentPath(const std::string& file_path) {
+  const auto pos = file_path.find_last_of('/');
+  if (pos == std::string::npos) return "";
+  if (pos == 0) return "/";
+  return file_path.substr(0, pos);
+}
+
+bool ensureDirectoryExists(const std::string& path) {
+  if (path.empty() || path == "/") return true;
+  std::string current;
+  if (path[0] == '/') current = "/";
+
+  std::stringstream ss(path);
+  std::string part;
+  while (std::getline(ss, part, '/')) {
+    if (part.empty()) continue;
+    if (current.size() > 1) current += "/";
+    current += part;
+    if (::mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) return false;
+  }
+  return true;
+}
+
+std::string formatLocalTimestamp(std::time_t timestamp) {
+  std::tm local_tm{};
+  localtime_r(&timestamp, &local_tm);
+  char buffer[64];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S%z", &local_tm);
+  std::string out(buffer);
+  if (out.size() == 24) {
+    out.insert(out.size() - 2, ":");
+  }
+  return out;
+}
+
+std::time_t nextMidnightAfterMinimumHours(int minimum_hours) {
+  const std::time_t now = std::time(nullptr);
+  std::time_t minimum_until = now + static_cast<std::time_t>(minimum_hours) * 60 * 60;
+  std::tm tm{};
+  localtime_r(&minimum_until, &tm);
+  tm.tm_hour = 0;
+  tm.tm_min = 0;
+  tm.tm_sec = 0;
+  tm.tm_mday += 1;
+  tm.tm_isdst = -1;
+  return std::mktime(&tm);
+}
+
+bool parseLocalTimestamp(const std::string& text, std::time_t& out) {
+  if (text.size() < 19) return false;
+  std::tm tm{};
+  std::istringstream ss(text.substr(0, 19));
+  ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+  if (ss.fail()) return false;
+  tm.tm_isdst = -1;
+  out = std::mktime(&tm);
+  return out != static_cast<std::time_t>(-1);
+}
+
+bool isValidSuspensionMode(const std::string& mode) {
+  static const std::set<std::string> modes = {"none", "pause_1_day", "pause_3_days"};
+  return modes.count(mode) > 0;
+}
+
+json createFallbackTimetableJson() {
+  return {
+      {"version", 1},
+      {"time", {{"timezone", "Europe/Berlin"}, {"required", true}, {"allowed_sources", {"ntp", "gps", "manual", "system"}}, {"fallback_source", "system"}, {"require_valid_time", true}}},
+      {"timetable", {{"fallback_monday_1000_1200", {{"day", "Monday"}, {"start", "10:00"}, {"end", "12:00"}, {"end_behavior", "return_to_dock"}, {"enabled", true}, {"auto_start", true}, {"minimum_remaining_window_minutes", 1}, {"required_battery_state", "sufficient"}}}}},
+      {"outside_window", {{"outside_default", {{"allow_start", false}, {"enabled", true}}}}},
+      {"on_window_end", {{"window_end_default", {{"default_mode", "return_to_dock"}, {"allowed_modes", {"return_to_dock", "finish_current_run", "pause", "stop"}}, {"enabled", true}}}}},
+      {"suspension", {{"current", {{"enabled", false}, {"mode", "none"}, {"started_at", nullptr}, {"pause_until", nullptr}}}, {"options", {{"pause_one_day", {{"type", "pause_1_day"}, {"minimum_hours", 24}, {"until_next_midnight", true}, {"enabled", true}}}, {"pause_three_days", {{"type", "pause_3_days"}, {"minimum_hours", 72}, {"until_next_midnight", true}, {"enabled", true}}}}}}},
+      {"metadata", {{"created_by", "timetable_service_fallback"}, {"created_at", formatLocalTimestamp(std::time(nullptr))}, {"description", "Automatically created fallback timetable"}}},
+  };
+}
+
 }  // namespace
 
 class TimetableService {
@@ -201,6 +289,19 @@ class TimetableService {
 
   bool reloadFromFile() {
     std::ifstream f(timetable_file_);
+    std::vector<std::string> pre_remarks;
+    if (!f.good()) {
+      pre_remarks.emplace_back("Timetable file missing, creating fallback: " + timetable_file_);
+      if (!createFallbackTimetableFile(pre_remarks)) {
+        valid_ = false;
+        remarks_ = pre_remarks;
+        publishStatus(buildStatusJson(false, remarks_, Evaluation{}, nullptr));
+        ROS_ERROR_STREAM("Cannot create fallback timetable file: " << timetable_file_);
+        return false;
+      }
+      f.open(timetable_file_);
+    }
+
     if (!f.good()) {
       valid_ = false;
       remarks_ = {"Cannot open timetable file: " + timetable_file_};
@@ -220,7 +321,7 @@ class TimetableService {
       return false;
     }
 
-    std::vector<std::string> remarks;
+    std::vector<std::string> remarks = pre_remarks;
     TimetableConfig candidate;
     if (!parseTimetableJson(loaded, candidate, remarks)) {
       valid_ = false;
@@ -233,12 +334,35 @@ class TimetableService {
     config_ = candidate;
     valid_ = true;
     remarks_ = remarks;
+    if (config_.raw != loaded) {
+      saveTimetableToFile();
+    }
     evaluateAndPublish();
     ROS_INFO_STREAM("Timetable loaded from " << timetable_file_ << " with " << config_.entries.size() << " entries");
     return true;
   }
 
+  bool createFallbackTimetableFile(std::vector<std::string>& remarks) const {
+    if (!ensureDirectoryExists(parentPath(timetable_file_))) {
+      remarks.emplace_back("Could not create timetable directory: " + parentPath(timetable_file_));
+      return false;
+    }
+    std::ofstream f(timetable_file_);
+    if (!f.good()) {
+      remarks.emplace_back("Could not write fallback timetable file: " + timetable_file_);
+      return false;
+    }
+    f << createFallbackTimetableJson().dump(2) << std::endl;
+    remarks.emplace_back("Fallback timetable created with Monday 10:00-12:00");
+    return true;
+  }
+
   bool saveTimetableToFile() {
+    if (!ensureDirectoryExists(parentPath(timetable_file_))) {
+      remarks_.push_back("Could not create timetable directory: " + parentPath(timetable_file_));
+      ROS_ERROR_STREAM("Could not create timetable directory: " << parentPath(timetable_file_));
+      return false;
+    }
     std::ofstream f(timetable_file_);
     if (!f.good()) {
       remarks_.push_back("Could not save timetable to file: " + timetable_file_);
@@ -357,6 +481,56 @@ class TimetableService {
       ok = false;
     }
 
+    if (root.contains("suspension")) {
+      if (!root["suspension"].is_object()) {
+        remarks.emplace_back("suspension must be an object");
+        ok = false;
+      } else {
+        json& raw_suspension = out.raw["suspension"];
+        if (!raw_suspension.contains("current") || !raw_suspension["current"].is_object()) {
+          raw_suspension["current"] = {{"enabled", false}, {"mode", "none"}, {"started_at", nullptr}, {"pause_until", nullptr}};
+        }
+        json& current = raw_suspension["current"];
+        out.suspension_enabled = current.value("enabled", false);
+        out.suspension_mode = current.value("mode", std::string("none"));
+        if (!isValidSuspensionMode(out.suspension_mode)) {
+          remarks.emplace_back("suspension.current.mode has invalid value: " + out.suspension_mode);
+          ok = false;
+        }
+        if (out.suspension_enabled && out.suspension_mode != "none") {
+          const int minimum_hours = out.suspension_mode == "pause_3_days" ? 72 : 24;
+          std::time_t pause_until = 0;
+          const bool has_pause_until = current.contains("pause_until") && current["pause_until"].is_string() &&
+                                       parseLocalTimestamp(current["pause_until"].get<std::string>(), pause_until);
+          if (!has_pause_until) {
+            const std::string now_text = formatLocalTimestamp(std::time(nullptr));
+            pause_until = nextMidnightAfterMinimumHours(minimum_hours);
+            current["started_at"] = now_text;
+            current["pause_until"] = formatLocalTimestamp(pause_until);
+            remarks.emplace_back("suspension.current.pause_until calculated for " + out.suspension_mode);
+          }
+          if (pause_until <= std::time(nullptr)) {
+            current["enabled"] = false;
+            current["mode"] = "none";
+            current["started_at"] = nullptr;
+            current["pause_until"] = nullptr;
+            out.suspension_enabled = false;
+            out.suspension_mode = "none";
+            remarks.emplace_back("suspension expired and was disabled");
+          } else {
+            out.suspension_pause_until_time = pause_until;
+            out.suspension_started_at = current.value("started_at", std::string(""));
+            out.suspension_pause_until = current.value("pause_until", std::string(""));
+          }
+        }
+      }
+    } else {
+      out.raw["suspension"] = {{"current", {{"enabled", false}, {"mode", "none"}, {"started_at", nullptr}, {"pause_until", nullptr}}},
+                                  {"options", {{"pause_one_day", {{"type", "pause_1_day"}, {"minimum_hours", 24}, {"until_next_midnight", true}, {"enabled", true}}},
+                                                 {"pause_three_days", {{"type", "pause_3_days"}, {"minimum_hours", 72}, {"until_next_midnight", true}, {"enabled", true}}}}}};
+      remarks.emplace_back("suspension section missing, added defaults");
+    }
+
     if (!root.contains("timetable") || !root["timetable"].is_object()) {
       remarks.emplace_back("timetable object is missing");
       ok = false;
@@ -460,16 +634,28 @@ class TimetableService {
     if (active != nullptr) {
       e.active_window = true;
       e.start_allowed = true;
+      e.auto_mowing_time = active->auto_start;
       e.active_entry_id = active->id;
       e.active_day = active->day;
       e.active_start = active->start_text;
       e.active_end = active->end_text;
       e.end_behavior = active->end_behavior;
       e.remaining_window_minutes = active->end_minutes - now_minutes;
-      e.reason = "inside_active_window";
+      e.reason = active->auto_start ? "inside_active_window" : "active_window_but_auto_start_disabled";
     } else {
       e.start_allowed = config_.outside_allow_start;
       e.reason = config_.outside_allow_start ? "outside_window_start_allowed_by_rule" : "outside_time_window";
+    }
+
+    if (config_.suspension_enabled && config_.suspension_pause_until_time > std::time(nullptr)) {
+      e.suspended = true;
+      e.suspension_mode = config_.suspension_mode;
+      e.suspended_until = config_.suspension_pause_until;
+      e.auto_mowing_time = false;
+      e.start_allowed = false;
+      e.mission_trigger_allowed = false;
+      e.reason = "timetable_suspended";
+      return e;
     }
 
     e.mission_trigger_allowed = canTriggerMission(e);
@@ -480,6 +666,8 @@ class TimetableService {
     if (!valid_) return false;
     if (!e.time_valid) return false;
     if (!e.active_window) return false;
+    if (e.suspended) return false;
+    if (!e.auto_mowing_time) return false;
     if (!config_.auto_start) return false;
     if (!has_high_level_status_) return false;
     if (last_high_level_status_.emergency) return false;
@@ -610,12 +798,17 @@ class TimetableService {
     json status;
     status["valid"] = valid;
     status["remarks"] = remarks;
-    status["time"] = {
+
+    status["time_state"] = {
         {"valid", e.time_valid},
         {"source", e.time_source},
-        {"timezone", valid ? config_.timezone : nullptr},
+        {"timezone", valid ? json(config_.timezone) : json(nullptr)},
     };
-    status["state"] = {
+    // Backwards-compatible alias for already existing consumers.
+    status["time"] = status["time_state"];
+
+    json robot_state = {
+        {"auto_mowing_time", e.auto_mowing_time},
         {"active_window", e.active_window},
         {"start_allowed", e.start_allowed},
         {"mission_trigger_allowed", e.mission_trigger_allowed},
@@ -625,12 +818,19 @@ class TimetableService {
         {"active_end", e.active_end.empty() ? json(nullptr) : json(e.active_end)},
         {"remaining_window_minutes", e.remaining_window_minutes},
         {"end_behavior", e.end_behavior.empty() ? json(nullptr) : json(e.end_behavior)},
+        {"suspended", e.suspended},
+        {"suspension_mode", e.suspension_mode},
+        {"suspended_until", e.suspended_until.empty() ? json(nullptr) : json(e.suspended_until)},
         {"reason", e.reason},
         {"mission_started_by_service", mission_started_by_service_},
         {"service_started_mission_left_dock", service_started_mission_left_dock_},
         {"last_started_entry_id", last_started_entry_id_.empty() ? json(nullptr) : json(last_started_entry_id_)},
         {"has_high_level_status", has_high_level_status_},
     };
+    status["robot_state"] = robot_state;
+    // Backwards-compatible alias for already existing consumers.
+    status["state"] = robot_state;
+
     if (has_high_level_status_) {
       status["robot"] = {
           {"state", last_high_level_status_.state},
