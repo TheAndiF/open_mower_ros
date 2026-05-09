@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="2">
+    <name>mower_timetable</name>
+    <version>0.0.0</version>
+    <description>Timetable service for time based OpenMower mission triggering</description>
+    <maintainer email="openmower@example.invalid">OpenMower contributors</maintainer>
+    <license>GPL-3.0</license>
+
+    <buildtool_depend>catkin</buildtool_depend>
+
+    <build_depend>roscpp</build_depend>
+    <build_depend>std_msgs</build_depend>
+    <build_depend>std_srvs</build_depend>
+    <build_depend>mower_msgs</build_depend>
+    <build_depend>xbot_rpc</build_depend>
+
+    <build_export_depend>roscpp</build_export_depend>
+    <build_export_depend>std_msgs</build_export_depend>
+    <build_export_depend>std_srvs</build_export_depend>
+    <build_export_depend>mower_msgs</build_export_depend>
+    <build_export_depend>xbot_rpc</build_export_depend>
+
+    <exec_depend>roscpp</exec_depend>
+    <exec_depend>std_msgs</exec_depend>
+    <exec_depend>std_srvs</exec_depend>
+    <exec_depend>mower_msgs</exec_depend>
+    <exec_depend>xbot_rpc</exec_depend>
+
+    <export/>
+</package>

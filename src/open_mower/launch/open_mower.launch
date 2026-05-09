@@ -9,6 +9,9 @@
 
 
     <node pkg="mower_map" type="mower_map_service" name="map_service" output="screen" respawn="true" respawn_delay="10"/>
+    <node pkg="mower_timetable" type="timetable_service" name="timetable_service" output="screen" respawn="true" respawn_delay="10">
+        <param name="timetable_file" value="/srv/ros/timetable.json"/>
+    </node>
     <node pkg="mower_logic" type="mower_logic" name="mower_logic" output="screen" respawn="true" respawn_delay="10">
     </node>
     <node pkg="slic3r_coverage_planner" type="slic3r_coverage_planner" name="slic3r_coverage_planner" output="screen" respawn="true" respawn_delay="10"/>
