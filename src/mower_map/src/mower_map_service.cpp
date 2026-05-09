@@ -46,6 +46,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 using json = nlohmann::ordered_json;
@@ -64,8 +65,11 @@ const std::string LEGACY_MAP_FILE = "map.bag";
 // Forward declarations
 void saveMapToFile();
 void buildMap();
-bool normalizeAndOrderAreas();
-void updatePersistentMap();
+bool normalizeAreaProperties();
+bool hasValidMowingOrder();
+bool recalculateMowingOrder();
+bool prepareMapAreasOnStartup();
+void updatePersistentMap(bool recalculate_order);
 
 // Struct definitions for JSON serialization
 struct Point {
@@ -231,8 +235,8 @@ xbot_rpc::RpcProvider rpc_provider("mower_map_service", {{
     } catch (const std::exception& e) {
       throw xbot_rpc::RpcException(xbot_rpc::RpcError::ERROR_INVALID_PARAMS, "Invalid map: " + std::string(e.what()));
     }
-    updatePersistentMap();
-    ROS_INFO_STREAM("Loaded " << map_data.areas.size() << " areas via RPC and saved to file");
+    updatePersistentMap(true);
+    ROS_INFO_STREAM("Loaded " << map_data.areas.size() << " areas via RPC, recalculated mowing order and saved to file");
     return "Successfully stored map (" + std::to_string(map_data.areas.size()) + " areas)";
   }),
 }});
@@ -377,7 +381,8 @@ double distancePolygonsSquared(const Polygon& a, const Polygon& b) {
   return best;
 }
 
-// Two areas are considered connected when their polygons touch/overlap or are closer than this tolerance.
+
+// Two polygons are considered connected when they touch/overlap or are closer than this tolerance.
 // The tolerance is important because map polygons rarely touch exactly due to GPS/float noise.
 constexpr double MOWING_ORDER_CONNECTION_TOLERANCE = 0.30;  // meters
 
@@ -469,7 +474,7 @@ std::vector<MapArea*> calculateOrderedMowingAreas() {
       // First mowing area: start from the docking station and choose the closest mowing area.
       selection_pool = candidates;
     } else {
-      // Following mowing areas: only choose areas that are directly connected or reachable via nav areas.
+      // Following mowing areas: prefer only areas directly connected or reachable via nav areas.
       for (auto* candidate : candidates) {
         if (mowingAreasConnectedDirectlyOrViaNav(*current_area, *candidate)) {
           selection_pool.push_back(candidate);
@@ -512,7 +517,7 @@ std::vector<MapArea*> calculateOrderedMowingAreas() {
   return ordered;
 }
 
-bool normalizeAndOrderAreas() {
+bool normalizeAreaProperties() {
   bool changed = false;
 
   for (auto& area : map_data.areas) {
@@ -521,18 +526,55 @@ bool normalizeAndOrderAreas() {
       changed = true;
     }
 
-    if (area.type != "mow") {
-      if (area.mowing_enabled != false) {
-        area.mowing_enabled = false;
-        changed = true;
-      }
+    if (area.type == "mow") {
+      // Missing mowing_enabled defaults to true in from_json(). Keep existing explicit values.
+      continue;
+    }
 
-      if (area.mowing_order != 0) {
-        area.mowing_order = 0;
-        changed = true;
-      }
+    // Non-mowing areas are never part of the active mowing sequence.
+    if (area.mowing_enabled != false) {
+      area.mowing_enabled = false;
+      changed = true;
+    }
+
+    if (area.mowing_order != 0) {
+      area.mowing_order = 0;
+      changed = true;
     }
   }
+
+  return changed;
+}
+
+bool hasValidMowingOrder() {
+  std::set<int> used_orders;
+  size_t mow_area_count = 0;
+
+  for (const auto& area : map_data.areas) {
+    if (area.type != "mow") continue;
+    if (area.outline.empty()) continue;
+
+    ++mow_area_count;
+
+    if (area.mowing_order <= 0) {
+      ROS_WARN_STREAM("Mowing area '" << area.name << "' (" << area.id
+                      << ") has missing/invalid mowing_order=" << area.mowing_order);
+      return false;
+    }
+
+    if (!used_orders.insert(area.mowing_order).second) {
+      ROS_WARN_STREAM("Duplicate mowing_order=" << area.mowing_order
+                      << " found at mowing area '" << area.name << "' (" << area.id << ")");
+      return false;
+    }
+  }
+
+  if (mow_area_count == 0) return true;
+  return true;
+}
+
+bool recalculateMowingOrder() {
+  bool changed = false;
 
   int order = 10;
   for (auto* area : calculateOrderedMowingAreas()) {
@@ -541,6 +583,34 @@ bool normalizeAndOrderAreas() {
       changed = true;
     }
     order += 10;
+  }
+
+  // Ensure non-mowing areas never keep stale order values.
+  for (auto& area : map_data.areas) {
+    if (area.type == "mow") continue;
+    if (area.mowing_order != 0) {
+      area.mowing_order = 0;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * Startup behavior:
+ *  - Normalize area properties.
+ *  - Keep an existing valid mowing_order exactly as stored in map.json.
+ *  - Recalculate only if the stored mowing_order is missing, duplicate or otherwise invalid.
+ */
+bool prepareMapAreasOnStartup() {
+  bool changed = normalizeAreaProperties();
+
+  if (!hasValidMowingOrder()) {
+    ROS_WARN_STREAM("Stored mowing_order is missing or invalid. Recalculating mowing order once on startup.");
+    changed = recalculateMowingOrder() || changed;
+  } else {
+    ROS_INFO_STREAM("Stored mowing_order is valid. Keeping existing mowing order.");
   }
 
   return changed;
@@ -804,8 +874,16 @@ void saveMapToFile() {
  * Normalize persistent map data, save it and rebuild all derived map outputs.
  * Use this after changes that should be stored in map.json.
  */
-void updatePersistentMap() {
-  normalizeAndOrderAreas();
+void updatePersistentMap(bool recalculate_order) {
+  normalizeAreaProperties();
+
+  if (recalculate_order) {
+    recalculateMowingOrder();
+  } else if (!hasValidMowingOrder()) {
+    ROS_WARN_STREAM("Persistent map update detected invalid mowing_order. Recalculating mowing order.");
+    recalculateMowingOrder();
+  }
+
   saveMapToFile();
   buildMap();
 }
@@ -840,7 +918,7 @@ bool addMowingArea(mower_map::AddMowingAreaSrvRequest& req, mower_map::AddMowing
     map_data.areas.push_back(mowerMapAreaToInternal(obstacle, "obstacle", ""));
   }
 
-  updatePersistentMap();
+  updatePersistentMap(true);
   return true;
 }
 
@@ -882,7 +960,7 @@ bool setDockingPoint(mower_map::SetDockingPointSrvRequest& req, mower_map::SetDo
                                        .position = {req.docking_pose.position.x, req.docking_pose.position.y},
                                        .heading = heading});
 
-  updatePersistentMap();
+  updatePersistentMap(true);
 
   return true;
 }
@@ -935,7 +1013,7 @@ bool clearMap(mower_map::ClearMapSrvRequest& req, mower_map::ClearMapSrvResponse
 
   map_data.clear();
 
-  updatePersistentMap();
+  updatePersistentMap(true);
   return true;
 }
 
@@ -1017,8 +1095,9 @@ void convertLegacyMapToJson() {
 
   bag.close();
 
-  // Save the converted data to JSON file
-  normalizeAndOrderAreas();
+  // Save the converted data to JSON file. Legacy conversion creates a new persistent map, so calculate the order.
+  normalizeAreaProperties();
+  recalculateMowingOrder();
   saveMapToFile();
 
   ROS_INFO_STREAM("Successfully converted legacy map to JSON with "
@@ -1042,8 +1121,9 @@ int main(int argc, char** argv) {
     readMapFromFile();
   }
 
-  normalizeAndOrderAreas();
-  saveMapToFile();
+  if (prepareMapAreasOnStartup()) {
+    saveMapToFile();
+  }
 
   buildMap();
 
