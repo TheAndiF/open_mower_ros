@@ -5,5 +5,9 @@
 inline const nlohmann::ordered_json CAPABILITIES = {
     {"rpc", 1},
     {"map:json", 1},
+    {"timetable:json", 1},
+    {"timetable:bson", 1},
+    {"timetable:set:json", 1},
+    {"timetable:set:bson", 1},
     {"mqtt:params", 1},
 };

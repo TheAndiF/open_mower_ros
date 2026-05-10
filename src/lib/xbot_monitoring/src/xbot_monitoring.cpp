@@ -33,6 +33,7 @@ void publish_capabilities();
 void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
+void publish_timetable();
 void publish_actions();
 void publish_version();
 void publish_params();
@@ -78,6 +79,7 @@ class MqttCallback : public mqtt::callback {
         publish_sensor_metadata();
         publish_map();
         publish_map_overlay();
+        publish_timetable();
         publish_actions();
         publish_version();
         publish_params();
@@ -93,6 +95,8 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "command", 0);
         client_->subscribe(this->mqtt_topic_prefix + "action", 0);
         client_->subscribe(this->mqtt_topic_prefix + "rpc/request", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/bson", 0);
     }
 
 public:
@@ -126,6 +130,31 @@ public:
         } else if (ptr->get_topic() == this->mqtt_topic_prefix + "rpc/request") {
           std::string payload = ptr->get_payload_str();
           rpc_request_callback(payload);
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/json") {
+            try {
+                json payload = json::parse(ptr->get_payload_str());
+                xbot_rpc::RpcRequest msg;
+                msg.method = "timetable.replace";
+                msg.params = json::array({payload}).dump();
+                msg.id = "mqtt_timetable_set_json";
+                rpc_request_pub.publish(msg);
+            } catch (const json::exception &e) {
+                ROS_ERROR_STREAM("Error decoding timetable JSON: " << e.what());
+            }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/bson") {
+            try {
+                json payload = json::from_bson(ptr->get_payload().begin(), ptr->get_payload().end());
+                if (payload.is_object() && payload.contains("d")) {
+                    payload = payload["d"];
+                }
+                xbot_rpc::RpcRequest msg;
+                msg.method = "timetable.replace";
+                msg.params = json::array({payload}).dump();
+                msg.id = "mqtt_timetable_set_bson";
+                rpc_request_pub.publish(msg);
+            } catch (const json::exception &e) {
+                ROS_ERROR_STREAM("Error decoding timetable BSON: " << e.what());
+            }
         }
     }
 private:
@@ -142,6 +171,12 @@ json map_overlay;
 std::mutex map_overlay_mutex;
 bool has_map = false;
 bool has_map_overlay = false;
+
+json timetable_status = json::object();
+json timetable_confirmed = json::object();
+std::mutex timetable_mutex;
+bool has_timetable = false;
+bool timetable_auto_mowing_time = false;
 
 xbot_rpc::RpcProvider rpc_provider("xbot_monitoring", {{
     RPC_METHOD("rpc.ping", {
@@ -490,6 +525,10 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
     j["current_path_index"] = msg->current_path_index;
     j["emergency"] = msg->emergency;
     j["is_charging"] = msg->is_charging;
+    {
+        std::lock_guard<std::mutex> lk(timetable_mutex);
+        j["auto_mowing_time"] = timetable_auto_mowing_time;
+    }
     j["rain_detected"] = msg->rain_detected;
     j["pose"]["x"] = msg->robot_pose.pose.pose.position.x;
     j["pose"]["y"] = msg->robot_pose.pose.pose.position.y;
@@ -556,6 +595,64 @@ void publish_map_overlay() {
     data["d"] = m;
     auto bson = json::to_bson(data);
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
+}
+
+void publish_timetable() {
+    json status;
+    json confirmed;
+    {
+        std::lock_guard<std::mutex> lk(timetable_mutex);
+        if(!has_timetable)
+            return;
+        status = timetable_status;
+        confirmed = timetable_confirmed;
+    }
+
+    // Confirmed timetable payload: same values as timetable.json / incoming MQTT payload.
+    try_publish("timetable/json", confirmed.dump(2), true);
+    json timetable_data;
+    timetable_data["d"] = confirmed;
+    auto timetable_bson = json::to_bson(timetable_data);
+    try_publish_binary("timetable/bson", timetable_bson.data(), timetable_bson.size(), true);
+
+    // Full service state with valid, remarks, robot_state and time_state.
+    try_publish("timetable_state/json", status.dump(2), true);
+    json status_data;
+    status_data["d"] = status;
+    auto status_bson = json::to_bson(status_data);
+    try_publish_binary("timetable_state/bson", status_bson.data(), status_bson.size(), true);
+}
+
+void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
+    try {
+        json status = json::parse(msg->data);
+        json confirmed = json::object();
+        bool auto_mowing_time = false;
+
+        if (status.is_object() && status.contains("timetable") && !status["timetable"].is_null()) {
+            confirmed = status["timetable"];
+        }
+
+        if (status.is_object()) {
+            if (status.contains("robot_state") && status["robot_state"].is_object()) {
+                auto_mowing_time = status["robot_state"].value("auto_mowing_time", false);
+            } else if (status.contains("state") && status["state"].is_object()) {
+                // Backwards compatibility with older timetable_service status field name.
+                auto_mowing_time = status["state"].value("auto_mowing_time", false);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(timetable_mutex);
+            timetable_status = status;
+            timetable_confirmed = confirmed;
+            timetable_auto_mowing_time = auto_mowing_time;
+            has_timetable = true;
+        }
+        publish_timetable();
+    } catch (const json::exception &e) {
+        ROS_ERROR_STREAM("Error processing timetable status JSON: " << e.what());
+    }
 }
 
 void map_callback(const std_msgs::String::ConstPtr &msg) {
@@ -739,6 +836,7 @@ int main(int argc, char **argv) {
 
     ros::Subscriber robotStateSubscriber = n->subscribe("xbot_monitoring/robot_state", 10, robot_state_callback);
     ros::Subscriber mapSubscriber = n->subscribe("mower_map_service/json_map", 10, map_callback);
+    ros::Subscriber timetableSubscriber = n->subscribe("timetable/status", 10, timetable_status_callback);
     ros::Subscriber mapOverlaySubscriber = n->subscribe("xbot_monitoring/map_overlay", 10, map_overlay_callback);
 
     cmd_vel_pub = n->advertise<geometry_msgs::Twist>("xbot_monitoring/remote_cmd_vel", 1);
