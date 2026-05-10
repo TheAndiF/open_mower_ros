@@ -9,5 +9,7 @@ inline const nlohmann::ordered_json CAPABILITIES = {
     {"timetable:bson", 1},
     {"timetable:set:json", 1},
     {"timetable:set:bson", 1},
+    {"timetable:renew:json", 1},
+    {"timetable:renew:bson", 1},
     {"mqtt:params", 1},
 };

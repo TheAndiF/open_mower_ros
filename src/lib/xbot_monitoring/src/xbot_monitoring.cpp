@@ -34,6 +34,7 @@ void publish_sensor_metadata();
 void publish_map();
 void publish_map_overlay();
 void publish_timetable();
+void maybe_publish_timetable(bool force = false);
 void publish_actions();
 void publish_version();
 void publish_params();
@@ -97,6 +98,8 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "rpc/request", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/json", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/bson", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/bson", 0);
     }
 
 public:
@@ -155,6 +158,11 @@ public:
             } catch (const json::exception &e) {
                 ROS_ERROR_STREAM("Error decoding timetable BSON: " << e.what());
             }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/json" ||
+                   ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/bson") {
+            // App opened the timetable page and requests the current retained timetable again.
+            // The payload is intentionally optional; any message on this topic triggers a republish.
+            maybe_publish_timetable(true);
         }
     }
 private:
@@ -177,6 +185,9 @@ json timetable_confirmed = json::object();
 std::mutex timetable_mutex;
 bool has_timetable = false;
 bool timetable_auto_mowing_time = false;
+std::string timetable_auto_mow_id = "";
+ros::Time last_timetable_publish_time;
+double mqtt_timetable_publish_interval_sec = 60.0;
 
 xbot_rpc::RpcProvider rpc_provider("xbot_monitoring", {{
     RPC_METHOD("rpc.ping", {
@@ -527,7 +538,8 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
     j["is_charging"] = msg->is_charging;
     {
         std::lock_guard<std::mutex> lk(timetable_mutex);
-        j["auto_mowing_time"] = timetable_auto_mowing_time;
+        j["AutoMow"] = timetable_auto_mowing_time ? 1 : 0;
+        j["AutoMowID"] = timetable_auto_mow_id;
     }
     j["rain_detected"] = msg->rain_detected;
     j["pose"]["x"] = msg->robot_pose.pose.pose.position.x;
@@ -598,29 +610,39 @@ void publish_map_overlay() {
 }
 
 void publish_timetable() {
-    json status;
     json confirmed;
     {
         std::lock_guard<std::mutex> lk(timetable_mutex);
         if(!has_timetable)
             return;
-        status = timetable_status;
         confirmed = timetable_confirmed;
+        last_timetable_publish_time = ros::Time::now();
     }
 
     // Confirmed timetable payload: same values as timetable.json / incoming MQTT payload.
+    // This is the resource state and is retained. It is sent on boot, renew, reload/change,
+    // and optionally in a slow heartbeat. There is intentionally no timetable_state topic.
     try_publish("timetable/json", confirmed.dump(2), true);
     json timetable_data;
     timetable_data["d"] = confirmed;
     auto timetable_bson = json::to_bson(timetable_data);
     try_publish_binary("timetable/bson", timetable_bson.data(), timetable_bson.size(), true);
+}
 
-    // Full service state with valid, remarks, robot_state and time_state.
-    try_publish("timetable_state/json", status.dump(2), true);
-    json status_data;
-    status_data["d"] = status;
-    auto status_bson = json::to_bson(status_data);
-    try_publish_binary("timetable_state/bson", status_bson.data(), status_bson.size(), true);
+void maybe_publish_timetable(bool force) {
+    if (force) {
+        publish_timetable();
+        return;
+    }
+
+    if (mqtt_timetable_publish_interval_sec <= 0.0) {
+        return;
+    }
+
+    if (last_timetable_publish_time.isZero() ||
+        (ros::Time::now() - last_timetable_publish_time).toSec() >= mqtt_timetable_publish_interval_sec) {
+        publish_timetable();
+    }
 }
 
 void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
@@ -628,28 +650,49 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
         json status = json::parse(msg->data);
         json confirmed = json::object();
         bool auto_mowing_time = false;
+        std::string auto_mow_id;
+        bool timetable_changed = false;
 
         if (status.is_object() && status.contains("timetable") && !status["timetable"].is_null()) {
             confirmed = status["timetable"];
         }
 
         if (status.is_object()) {
+            json robot_state = json::object();
             if (status.contains("robot_state") && status["robot_state"].is_object()) {
-                auto_mowing_time = status["robot_state"].value("auto_mowing_time", false);
+                robot_state = status["robot_state"];
             } else if (status.contains("state") && status["state"].is_object()) {
                 // Backwards compatibility with older timetable_service status field name.
-                auto_mowing_time = status["state"].value("auto_mowing_time", false);
+                robot_state = status["state"];
             }
+
+            if (robot_state.is_object()) {
+                auto_mowing_time = robot_state.value("auto_mowing_time", false);
+                if (robot_state.contains("active_entry_id") && robot_state["active_entry_id"].is_string()) {
+                    auto_mow_id = robot_state["active_entry_id"].get<std::string>();
+                }
+            }
+        }
+
+        if (!auto_mowing_time) {
+            auto_mow_id.clear();
         }
 
         {
             std::lock_guard<std::mutex> lk(timetable_mutex);
+            timetable_changed = !has_timetable || timetable_confirmed != confirmed;
             timetable_status = status;
             timetable_confirmed = confirmed;
             timetable_auto_mowing_time = auto_mowing_time;
+            timetable_auto_mow_id = auto_mow_id;
             has_timetable = true;
         }
-        publish_timetable();
+
+        // Publish the timetable resource only when it appears/changes. A slow heartbeat is
+        // handled in the main loop, and app requests use timetable/renew/json or /bson.
+        if (timetable_changed) {
+            publish_timetable();
+        }
     } catch (const json::exception &e) {
         ROS_ERROR_STREAM("Error processing timetable status JSON: " << e.what());
     }
@@ -820,6 +863,7 @@ int main(int argc, char **argv) {
         external_mqtt_topic_prefix = external_mqtt_topic_prefix+"/";
     }
 
+    mqtt_timetable_publish_interval_sec = paramNh.param("mqtt_timetable_publish_interval_sec", 60.0);
     external_mqtt_hostname = paramNh.param("external_mqtt_hostname", std::string(""));
     external_mqtt_port = std::to_string(paramNh.param("external_mqtt_port", 1883));
     external_mqtt_username = paramNh.param("external_mqtt_username", std::string(""));
@@ -899,6 +943,7 @@ int main(int argc, char **argv) {
                 }
             );
         });
+        maybe_publish_timetable(false);
         sensor_check_rate.sleep();
     }
     return 0;
