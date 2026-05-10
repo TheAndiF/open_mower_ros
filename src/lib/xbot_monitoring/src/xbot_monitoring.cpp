@@ -35,6 +35,7 @@ void publish_map();
 void publish_map_overlay();
 void publish_timetable();
 void maybe_publish_timetable(bool force = false);
+void publish_timetable_validation(const json &validation);
 void publish_actions();
 void publish_version();
 void publish_params();
@@ -100,6 +101,8 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/bson", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/json", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/bson", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/suspension/set/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/suspension/set/bson", 0);
     }
 
 public:
@@ -142,7 +145,7 @@ public:
                 msg.id = "mqtt_timetable_set_json";
                 rpc_request_pub.publish(msg);
             } catch (const json::exception &e) {
-                ROS_ERROR_STREAM("Error decoding timetable JSON: " << e.what());
+                publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding timetable JSON: ") + e.what()}}});
             }
         } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/bson") {
             try {
@@ -156,7 +159,32 @@ public:
                 msg.id = "mqtt_timetable_set_bson";
                 rpc_request_pub.publish(msg);
             } catch (const json::exception &e) {
-                ROS_ERROR_STREAM("Error decoding timetable BSON: " << e.what());
+                publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding timetable BSON: ") + e.what()}}});
+            }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/suspension/set/json") {
+            try {
+                json payload = json::parse(ptr->get_payload_str());
+                xbot_rpc::RpcRequest msg;
+                msg.method = "timetable.suspension_set";
+                msg.params = json::array({payload}).dump();
+                msg.id = "mqtt_timetable_suspension_set_json";
+                rpc_request_pub.publish(msg);
+            } catch (const json::exception &e) {
+                publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding suspension JSON: ") + e.what()}}});
+            }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/suspension/set/bson") {
+            try {
+                json payload = json::from_bson(ptr->get_payload().begin(), ptr->get_payload().end());
+                if (payload.is_object() && payload.contains("d")) {
+                    payload = payload["d"];
+                }
+                xbot_rpc::RpcRequest msg;
+                msg.method = "timetable.suspension_set";
+                msg.params = json::array({payload}).dump();
+                msg.id = "mqtt_timetable_suspension_set_bson";
+                rpc_request_pub.publish(msg);
+            } catch (const json::exception &e) {
+                publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding suspension BSON: ") + e.what()}}});
             }
         } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/json" ||
                    ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/bson") {
@@ -186,6 +214,7 @@ std::mutex timetable_mutex;
 bool has_timetable = false;
 bool timetable_auto_mowing_time = false;
 std::string timetable_auto_mow_id = "";
+json timetable_auto_mow_suspension = 0;
 ros::Time last_timetable_publish_time;
 double mqtt_timetable_publish_interval_sec = 60.0;
 
@@ -540,6 +569,7 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
         std::lock_guard<std::mutex> lk(timetable_mutex);
         j["AutoMow"] = timetable_auto_mowing_time ? 1 : 0;
         j["AutoMowID"] = timetable_auto_mow_id;
+        j["AutoMowSuspension"] = timetable_auto_mow_suspension;
     }
     j["rain_detected"] = msg->rain_detected;
     j["pose"]["x"] = msg->robot_pose.pose.pose.position.x;
@@ -609,6 +639,14 @@ void publish_map_overlay() {
     try_publish_binary("map_overlay/bson", bson.data(), bson.size(), true);
 }
 
+void publish_timetable_validation(const json &validation) {
+    try_publish("timetable/validation/json", validation.dump(2), true);
+    json data;
+    data["d"] = validation;
+    auto bson = json::to_bson(data);
+    try_publish_binary("timetable/validation/bson", bson.data(), bson.size(), true);
+}
+
 void publish_timetable() {
     json confirmed;
     {
@@ -651,6 +689,7 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
         json confirmed = json::object();
         bool auto_mowing_time = false;
         std::string auto_mow_id;
+        json auto_mow_suspension = 0;
         bool timetable_changed = false;
 
         if (status.is_object() && status.contains("timetable") && !status["timetable"].is_null()) {
@@ -667,9 +706,20 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
             }
 
             if (robot_state.is_object()) {
-                auto_mowing_time = robot_state.value("auto_mowing_time", false);
-                if (robot_state.contains("active_entry_id") && robot_state["active_entry_id"].is_string()) {
+                if (robot_state.contains("AutoMow")) {
+                    auto_mowing_time = robot_state.value("AutoMow", 0) == 1;
+                } else {
+                    auto_mowing_time = robot_state.value("auto_mowing_time", false);
+                }
+                if (robot_state.contains("AutoMowID") && robot_state["AutoMowID"].is_string()) {
+                    auto_mow_id = robot_state["AutoMowID"].get<std::string>();
+                } else if (robot_state.contains("active_entry_id") && robot_state["active_entry_id"].is_string()) {
                     auto_mow_id = robot_state["active_entry_id"].get<std::string>();
+                }
+                if (robot_state.contains("AutoMowSuspension")) {
+                    auto_mow_suspension = robot_state["AutoMowSuspension"];
+                } else if (robot_state.contains("suspended_until") && robot_state["suspended_until"].is_string()) {
+                    auto_mow_suspension = robot_state["suspended_until"];
                 }
             }
         }
@@ -685,6 +735,7 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
             timetable_confirmed = confirmed;
             timetable_auto_mowing_time = auto_mowing_time;
             timetable_auto_mow_id = auto_mow_id;
+            timetable_auto_mow_suspension = auto_mow_suspension;
             has_timetable = true;
         }
 
@@ -827,11 +878,25 @@ void rpc_response_callback(const xbot_rpc::RpcResponse::ConstPtr &msg) {
         return rpc_publish_error(xbot_rpc::RpcError::ERROR_INTERNAL, "Internal error while parsing result JSON: " + std::string(e.what()), msg->id);
     }
 
+    if (msg->id.find("mqtt_timetable_set") == 0 || msg->id.find("mqtt_timetable_suspension_set") == 0) {
+        if (result.is_object() && result.contains("valid")) {
+            publish_timetable_validation(result);
+        }
+    }
+
     json j = {{"jsonrpc", "2.0"}, {"result", result}, {"id", msg->id}};
     try_publish("rpc/response", j.dump(2));
 }
 
 void rpc_error_callback(const xbot_rpc::RpcError::ConstPtr &msg) {
+    if (msg->id.find("mqtt_timetable_set") == 0 || msg->id.find("mqtt_timetable_suspension_set") == 0) {
+        try {
+            json validation = json::parse(msg->message);
+            publish_timetable_validation(validation);
+        } catch (const json::exception &) {
+            publish_timetable_validation({{"valid", false}, {"remarks", {msg->message}}});
+        }
+    }
     rpc_publish_error(msg->code, msg->message, msg->id);
 }
 

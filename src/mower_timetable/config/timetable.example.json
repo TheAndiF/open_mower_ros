@@ -1,246 +1,47 @@
 {
   "version": 1,
-  "time": {
+  "metadata": {
+    "created_at": "2026-05-10T00:00:00+02:00",
+    "created_by": "openmower_app",
+    "description": "Example timetable configuration with timeSettings"
+  },
+  "timeSettings": {
     "timezone": "Europe/Berlin",
-    "required": true,
     "allowed_sources": [
       "ntp",
       "gps",
       "manual",
       "system"
     ],
-    "fallback_source": "system",
-    "require_valid_time": true
+    "active_source": "ntp",
+    "manual": {
+      "datetime": null
+    },
+    "ntp": {
+      "server": "pool.ntp.org"
+    },
+    "gps": {}
   },
   "timetable": {
-    "a8f3c2d1": {
+    "mow_20260510_090000_a8f3": {
       "day": "Monday",
-      "start": "08:00",
+      "start": "09:00",
       "end": "12:00",
       "end_behavior": "return_to_dock",
       "enabled": true,
       "auto_start": true,
-      "minimum_remaining_window_minutes": 30,
-      "required_battery_state": "full"
+      "minimum_remaining_window_minutes": 10,
+      "required_battery_state": "sufficient"
     },
-    "b91e74aa": {
-      "day": "Monday",
+    "mow_20260510_140000_b7c2": {
+      "day": "Friday",
       "start": "14:00",
-      "end": "18:00",
-      "end_behavior": "return_to_dock",
+      "end": "17:30",
+      "end_behavior": "finish_current_run",
       "enabled": true,
-      "auto_start": true,
-      "minimum_remaining_window_minutes": 30,
+      "auto_start": false,
+      "minimum_remaining_window_minutes": 15,
       "required_battery_state": "full"
-    },
-    "c02f9b31": {
-      "day": "Tuesday",
-      "start": "09:00",
-      "end": "16:00",
-      "end_behavior": "return_to_dock",
-      "enabled": true,
-      "auto_start": true,
-      "minimum_remaining_window_minutes": 30,
-      "required_battery_state": "full"
-    }
-  },
-  "outside_window": {
-    "d41f8c90": {
-      "allow_start": false,
-      "enabled": true
-    }
-  },
-  "on_window_end": {
-    "e91ab72c": {
-      "default_mode": "return_to_dock",
-      "allowed_modes": [
-        "return_to_dock",
-        "finish_current_run",
-        "pause",
-        "stop"
-      ],
-      "enabled": true
-    }
-  },
-  "metadata": {
-    "created_by": "manual",
-    "created_at": "2026-05-09T12:00:00+02:00",
-    "description": "Example timetable for first Timetable-Service test",
-    "field_options": {
-      "time.timezone": {
-        "type": "string",
-        "description": "IANA timezone used to interpret all timetable entries",
-        "examples": [
-          "Europe/Berlin",
-          "Europe/Vienna",
-          "Europe/Zurich",
-          "UTC"
-        ]
-      },
-      "time.required": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether time handling is required for this timetable"
-      },
-      "time.allowed_sources": {
-        "type": "array<string>",
-        "options": [
-          "ntp",
-          "gps",
-          "manual",
-          "system"
-        ],
-        "description": "Allowed sources for obtaining valid current time"
-      },
-      "time.fallback_source": {
-        "type": "string",
-        "options": [
-          "ntp",
-          "gps",
-          "manual",
-          "system"
-        ],
-        "description": "Fallback source used if the preferred source is unavailable"
-      },
-      "time.require_valid_time": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "If true, robot must not start unless current time is valid"
-      },
-      "timetable.*.day": {
-        "type": "string",
-        "options": [
-          "Monday",
-          "Tuesday",
-          "Wednesday",
-          "Thursday",
-          "Friday",
-          "Saturday",
-          "Sunday"
-        ],
-        "description": "Weekday for this timetable entry"
-      },
-      "timetable.*.start": {
-        "type": "string",
-        "format": "HH:MM",
-        "description": "Start time in local time.timezone"
-      },
-      "timetable.*.end": {
-        "type": "string",
-        "format": "HH:MM",
-        "description": "End time in local time.timezone"
-      },
-      "timetable.*.end_behavior": {
-        "type": "string",
-        "options": [
-          "return_to_dock",
-          "finish_current_run",
-          "pause",
-          "stop"
-        ],
-        "description": "Behavior when this timetable window ends"
-      },
-      "timetable.*.enabled": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether this timetable entry is active"
-      },
-      "outside_window.*.allow_start": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether the robot may start outside an active timetable window"
-      },
-      "outside_window.*.enabled": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether this outside-window rule is active"
-      },
-      "on_window_end.*.default_mode": {
-        "type": "string",
-        "options": [
-          "return_to_dock",
-          "finish_current_run",
-          "pause",
-          "stop"
-        ],
-        "description": "Default behavior when a timetable window ends"
-      },
-      "on_window_end.*.allowed_modes": {
-        "type": "array<string>",
-        "options": [
-          "return_to_dock",
-          "finish_current_run",
-          "pause",
-          "stop"
-        ],
-        "description": "Allowed end behaviors selectable for this timetable"
-      },
-      "on_window_end.*.enabled": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether this window-end behavior rule is active"
-      },
-      "timetable.*.auto_start": {
-        "type": "boolean",
-        "options": [
-          true,
-          false
-        ],
-        "description": "Whether this timetable entry may automatically trigger a mission"
-      },
-      "timetable.*.minimum_remaining_window_minutes": {
-        "type": "integer",
-        "minimum": 0,
-        "description": "Minimum remaining time in the active window required before starting a new mission"
-      },
-      "timetable.*.required_battery_state": {
-        "type": "string",
-        "options": [
-          "full",
-          "sufficient"
-        ],
-        "description": "Required battery state before automatically starting a mission. full uses battery_full_threshold, sufficient uses battery_sufficient_threshold."
-      }
-    }
-  },
-  "suspension": {
-    "current": {
-      "enabled": false,
-      "mode": "none",
-      "started_at": null,
-      "pause_until": null
-    },
-    "options": {
-      "pause_one_day": {
-        "type": "pause_1_day",
-        "minimum_hours": 24,
-        "until_next_midnight": true,
-        "enabled": true
-      },
-      "pause_three_days": {
-        "type": "pause_3_days",
-        "minimum_hours": 72,
-        "until_next_midnight": true,
-        "enabled": true
-      }
     }
   }
 }
