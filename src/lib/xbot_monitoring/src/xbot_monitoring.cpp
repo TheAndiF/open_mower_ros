@@ -99,10 +99,10 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "rpc/request", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/json", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/bson", 0);
-        client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/json", 0);
-        client_->subscribe(this->mqtt_topic_prefix + "timetable/renew/bson", 0);
-        client_->subscribe(this->mqtt_topic_prefix + "timetable/suspension/set/json", 0);
-        client_->subscribe(this->mqtt_topic_prefix + "timetable/suspension/set/bson", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/renew/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/renew/bson", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/suspension/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "timetable/set/suspension/bson", 0);
     }
 
 public:
@@ -161,7 +161,7 @@ public:
             } catch (const json::exception &e) {
                 publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding timetable BSON: ") + e.what()}}});
             }
-        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/suspension/set/json") {
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/suspension/json") {
             try {
                 json payload = json::parse(ptr->get_payload_str());
                 xbot_rpc::RpcRequest msg;
@@ -172,7 +172,7 @@ public:
             } catch (const json::exception &e) {
                 publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding suspension JSON: ") + e.what()}}});
             }
-        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/suspension/set/bson") {
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/suspension/bson") {
             try {
                 json payload = json::from_bson(ptr->get_payload().begin(), ptr->get_payload().end());
                 if (payload.is_object() && payload.contains("d")) {
@@ -186,8 +186,8 @@ public:
             } catch (const json::exception &e) {
                 publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding suspension BSON: ") + e.what()}}});
             }
-        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/json" ||
-                   ptr->get_topic() == this->mqtt_topic_prefix + "timetable/renew/bson") {
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/json" ||
+                   ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/bson") {
             // App opened the timetable page and requests the current retained timetable again.
             // The payload is intentionally optional; any message on this topic triggers a republish.
             maybe_publish_timetable(true);
@@ -740,7 +740,7 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
         }
 
         // Publish the timetable resource only when it appears/changes. A slow heartbeat is
-        // handled in the main loop, and app requests use timetable/renew/json or /bson.
+        // handled in the main loop, and app requests use timetable/set/renew/json or timetable/set/renew/bson.
         if (timetable_changed) {
             publish_timetable();
         }
