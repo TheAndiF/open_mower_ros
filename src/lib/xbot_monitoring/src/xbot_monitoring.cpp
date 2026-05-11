@@ -3,6 +3,7 @@
 // Copyright (c) 2022 Clemens Elflein. All rights reserved.
 //
 #include <filesystem>
+#include <cstdio>
 
 #include "ros/ros.h"
 #include <memory>
@@ -14,6 +15,7 @@
 #include <mqtt/async_client.h>
 #include <nlohmann/json.hpp>
 #include <vector>
+#include <set>
 #include "geometry_msgs/Twist.h"
 #include "std_msgs/String.h"
 #include "xbot_msgs/RegisterActionsSrv.h"
@@ -32,6 +34,8 @@ using json = nlohmann::ordered_json;
 void publish_capabilities();
 void publish_sensor_metadata();
 void publish_map();
+void publish_map_validation(const json &validation);
+json validate_map_payload_for_mqtt(const json &payload);
 void publish_map_overlay();
 void publish_timetable();
 void maybe_publish_timetable(bool force = false);
@@ -103,6 +107,8 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/renew/bson", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/suspension/json", 0);
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/suspension/bson", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "map/set/renew/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "map/set/json", 0);
     }
 
 public:
@@ -186,6 +192,26 @@ public:
             } catch (const json::exception &e) {
                 publish_timetable_validation({{"valid", false}, {"remarks", {std::string("Error decoding suspension BSON: ") + e.what()}}});
             }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "map/set/json") {
+            try {
+                json payload = json::parse(ptr->get_payload_str());
+                json validation = validate_map_payload_for_mqtt(payload);
+                if (!validation.value("valid", false)) {
+                    publish_map_validation(validation);
+                } else {
+                    xbot_rpc::RpcRequest msg;
+                    msg.method = "map.replace";
+                    msg.params = json::array({payload}).dump();
+                    msg.id = "mqtt_map_set_json";
+                    rpc_request_pub.publish(msg);
+                }
+            } catch (const json::exception &e) {
+                publish_map_validation({{"valid", false}, {"remarks", {std::string("Error decoding map JSON: ") + e.what()}}});
+            }
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "map/set/renew/json") {
+            // App opened the areas page and requests the current retained map again.
+            // The payload is intentionally optional; any message on this topic triggers a republish.
+            publish_map();
         } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/json" ||
                    ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/bson") {
             // App opened the timetable page and requests the current retained timetable again.
@@ -624,6 +650,61 @@ void publish_map() {
     try_publish_binary("map/bson", bson.data(), bson.size(), true);
 }
 
+void publish_map_validation(const json &validation) {
+    try_publish("map/validation/json", validation.dump(2), true);
+}
+
+json validate_map_payload_for_mqtt(const json &payload) {
+    json remarks = json::array();
+
+    if (!payload.is_object()) {
+        return {{"valid", false}, {"remarks", {"Map payload must be a JSON object"}}};
+    }
+
+    if (!payload.contains("areas") || !payload["areas"].is_array()) {
+        return {{"valid", false}, {"remarks", {"Map payload must contain an areas array"}}};
+    }
+
+    std::set<int> used_orders;
+    for (const auto &area : payload["areas"]) {
+        if (!area.is_object()) {
+            remarks.push_back("Each area must be a JSON object");
+            continue;
+        }
+
+        const std::string area_id = area.value("id", std::string("<unknown>"));
+        json properties = area.value("properties", json::object());
+        const std::string type = properties.value("type", std::string("draft"));
+
+        if (type != "mow") {
+            continue;
+        }
+
+        if (!properties.contains("mowing_order") || !properties["mowing_order"].is_number_integer()) {
+            remarks.push_back("Mowing area " + area_id + " has missing or non-integer mowing_order");
+            continue;
+        }
+
+        const int order = properties["mowing_order"].get<int>();
+        if (order < 1 || order > 99) {
+            remarks.push_back("Mowing area " + area_id + " has invalid mowing_order " + std::to_string(order) + " (allowed: 1-99)");
+            continue;
+        }
+
+        if (!used_orders.insert(order).second) {
+            char buf[3];
+            std::snprintf(buf, sizeof(buf), "%02d", order);
+            remarks.push_back(std::string("Mowing order ") + buf + " is used more than once");
+        }
+    }
+
+    if (!remarks.empty()) {
+        return {{"valid", false}, {"remarks", remarks}};
+    }
+
+    return {{"valid", true}, {"remarks", {"Map payload accepted"}}};
+}
+
 void publish_map_overlay() {
     json m;
     {
@@ -740,7 +821,7 @@ void timetable_status_callback(const std_msgs::String::ConstPtr &msg) {
         }
 
         // Publish the timetable resource only when it appears/changes. A slow heartbeat is
-        // handled in the main loop, and app requests use timetable/set/renew/json or timetable/set/renew/bson.
+        // handled in the main loop, and app requests use timetable/set/renew/json or /bson.
         if (timetable_changed) {
             publish_timetable();
         }
@@ -884,6 +965,16 @@ void rpc_response_callback(const xbot_rpc::RpcResponse::ConstPtr &msg) {
         }
     }
 
+    if (msg->id.find("mqtt_map_set") == 0) {
+        if (result.is_object() && result.contains("valid")) {
+            publish_map_validation(result);
+        } else if (result.is_string()) {
+            publish_map_validation({{"valid", true}, {"remarks", {result.get<std::string>()}}});
+        } else {
+            publish_map_validation({{"valid", true}, {"remarks", {"Map gespeichert"}}});
+        }
+    }
+
     json j = {{"jsonrpc", "2.0"}, {"result", result}, {"id", msg->id}};
     try_publish("rpc/response", j.dump(2));
 }
@@ -895,6 +986,14 @@ void rpc_error_callback(const xbot_rpc::RpcError::ConstPtr &msg) {
             publish_timetable_validation(validation);
         } catch (const json::exception &) {
             publish_timetable_validation({{"valid", false}, {"remarks", {msg->message}}});
+        }
+    }
+    if (msg->id.find("mqtt_map_set") == 0) {
+        try {
+            json validation = json::parse(msg->message);
+            publish_map_validation(validation);
+        } catch (const json::exception &) {
+            publish_map_validation({{"valid", false}, {"remarks", {msg->message}}});
         }
     }
     rpc_publish_error(msg->code, msg->message, msg->id);

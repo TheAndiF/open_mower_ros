@@ -236,9 +236,9 @@ xbot_rpc::RpcProvider rpc_provider("mower_map_service", {{
     } catch (const std::exception& e) {
       throw xbot_rpc::RpcException(xbot_rpc::RpcError::ERROR_INVALID_PARAMS, "Invalid map: " + std::string(e.what()));
     }
-    updatePersistentMap(true);
-    ROS_INFO_STREAM("Loaded " << map_data.areas.size() << " areas via RPC, recalculated mowing order and saved to file");
-    return "Successfully stored map (" + std::to_string(map_data.areas.size()) + " areas)";
+    updatePersistentMap(false);
+    ROS_INFO_STREAM("Loaded " << map_data.areas.size() << " areas via RPC, kept valid mowing order and saved to file");
+    return nlohmann::basic_json<>({{"valid", true}, {"remarks", {"Map gespeichert", "Mähflächen aktualisiert"}}});
   }),
 }});
 // clang-format on

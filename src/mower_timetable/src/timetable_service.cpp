@@ -44,7 +44,7 @@ struct TimetableEntry {
   std::string end_behavior = "return_to_dock";
   bool enabled = true;
   bool auto_start = true;
-  int minimum_remaining_window_minutes = 30;
+  int minimum_remaining_window_minutes = 1;
   std::string required_battery_state = "full";
 };
 
@@ -59,7 +59,7 @@ struct TimetableConfig {
   bool repeat_until_window_end = true;
   bool auto_start = true;
   std::string required_battery_state = "full";
-  int minimum_remaining_window_minutes = 30;
+  int minimum_remaining_window_minutes = 1;
   std::vector<TimetableEntry> entries;
 };
 
@@ -245,7 +245,7 @@ class TimetableService {
     private_nh_.param<double>("check_rate_hz", check_rate_hz_, 1.0);
     private_nh_.param<double>("battery_full_threshold", battery_full_threshold_, 0.98);
     private_nh_.param<double>("battery_sufficient_threshold", battery_sufficient_threshold_, 0.30);
-    private_nh_.param<int>("default_minimum_remaining_window_minutes", default_minimum_remaining_window_minutes_, 30);
+    private_nh_.param<int>("default_minimum_remaining_window_minutes", default_minimum_remaining_window_minutes_, 1);
     private_nh_.param<double>("start_command_cooldown_seconds", start_command_cooldown_seconds_, 60.0);
     private_nh_.param<bool>("dry_run", dry_run_, false);
     private_nh_.param<bool>("control_manual_missions_on_window_end", control_manual_missions_on_window_end_, false);
@@ -907,7 +907,7 @@ class TimetableService {
   double check_rate_hz_ = 1.0;
   double battery_full_threshold_ = 0.98;
   double battery_sufficient_threshold_ = 0.30;
-  int default_minimum_remaining_window_minutes_ = 30;
+  int default_minimum_remaining_window_minutes_ = 1;
   double start_command_cooldown_seconds_ = 60.0;
   bool dry_run_ = false;
   bool control_manual_missions_on_window_end_ = false;
