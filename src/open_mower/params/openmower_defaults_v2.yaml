@@ -51,3 +51,4 @@ mower_logic:
 
 xbot_monitoring:
   external_mqtt_enable: false
+  statustransition_log_mqtt_default_limit: 20

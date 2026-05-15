@@ -3,7 +3,13 @@
 // Copyright (c) 2022 Clemens Elflein. All rights reserved.
 //
 #include <filesystem>
+#include <algorithm>
 #include <cstdio>
+#include <fstream>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 
 #include "ros/ros.h"
 #include <memory>
@@ -40,6 +46,7 @@ void publish_map_overlay();
 void publish_timetable();
 void maybe_publish_timetable(bool force = false);
 void publish_timetable_validation(const json &validation);
+void publish_statustransition_log(std::size_t requested_limit = 0);
 void publish_actions();
 void publish_version();
 void publish_params();
@@ -86,6 +93,7 @@ class MqttCallback : public mqtt::callback {
         publish_map();
         publish_map_overlay();
         publish_timetable();
+        publish_statustransition_log();
         publish_actions();
         publish_version();
         publish_params();
@@ -109,6 +117,7 @@ class MqttCallback : public mqtt::callback {
         client_->subscribe(this->mqtt_topic_prefix + "timetable/set/suspension/bson", 0);
         client_->subscribe(this->mqtt_topic_prefix + "map/set/renew/json", 0);
         client_->subscribe(this->mqtt_topic_prefix + "map/set/json", 0);
+        client_->subscribe(this->mqtt_topic_prefix + "statustransition_log/set/renew/json", 0);
     }
 
 public:
@@ -212,6 +221,29 @@ public:
             // App opened the areas page and requests the current retained map again.
             // The payload is intentionally optional; any message on this topic triggers a republish.
             publish_map();
+        } else if (ptr->get_topic() == this->mqtt_topic_prefix + "statustransition_log/set/renew/json") {
+            // App requests the current retained status transition log again.
+            // Empty payload: use the configured default limit.
+            // Optional JSON payload: {"limit": 50} returns the newest N entries.
+            std::size_t requested_limit = 0;
+            const std::string payload_text = ptr->get_payload_str();
+            if (!payload_text.empty()) {
+                try {
+                    json payload = json::parse(payload_text);
+                    if (payload.is_object() && payload.contains("limit") && payload["limit"].is_number_unsigned()) {
+                        requested_limit = payload["limit"].get<std::size_t>();
+                    } else if (payload.is_object() && payload.contains("limit") && payload["limit"].is_number_integer()) {
+                        const auto limit = payload["limit"].get<long long>();
+                        if (limit > 0) {
+                            requested_limit = static_cast<std::size_t>(limit);
+                        }
+                    }
+                } catch (const json::exception &e) {
+                    ROS_WARN_STREAM("Error decoding statustransition log renew JSON: " << e.what()
+                                    << ". Falling back to configured default limit.");
+                }
+            }
+            publish_statustransition_log(requested_limit);
         } else if (ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/json" ||
                    ptr->get_topic() == this->mqtt_topic_prefix + "timetable/set/renew/bson") {
             // App opened the timetable page and requests the current retained timetable again.
@@ -243,6 +275,23 @@ std::string timetable_auto_mow_id = "";
 json timetable_auto_mow_suspension = 0;
 ros::Time last_timetable_publish_time;
 double mqtt_timetable_publish_interval_sec = 60.0;
+
+std::string statustransition_log_file = "/data/ros/log_statustransition.json";
+constexpr std::size_t STATUSTRANSITION_LOG_MAX_ENTRIES = 300;
+std::size_t mqtt_statustransition_log_default_limit = 20;
+std::mutex statustransition_log_mutex;
+json statustransition_log_entries = json::array();
+bool statustransition_log_loaded = false;
+bool has_last_statustransition_key = false;
+std::string last_statustransition_state;
+std::string last_statustransition_sub_state;
+bool last_statustransition_charging = false;
+bool last_statustransition_emergency = false;
+bool has_last_statustransition_timestamp = false;
+std::chrono::system_clock::time_point last_statustransition_timestamp;
+
+std::mutex latest_double_sensor_values_mutex;
+std::map<std::string, double> latest_double_sensor_values;
 
 xbot_rpc::RpcProvider rpc_provider("xbot_monitoring", {{
     RPC_METHOD("rpc.ping", {
@@ -548,6 +597,10 @@ void subscribe_to_sensor(std::string topic, std::vector<ros::Subscriber> &sensor
             ros::Subscriber s = n->subscribe<xbot_msgs::SensorDataDouble>(data_topic, 10, [info = sensor](
                     const xbot_msgs::SensorDataDouble::ConstPtr &msg) {
                 try_publish("sensors/" + info.sensor_id + "/data", std::to_string(msg->data));
+                {
+                    std::lock_guard<std::mutex> lk(latest_double_sensor_values_mutex);
+                    latest_double_sensor_values[info.sensor_id] = msg->data;
+                }
 
                 json data;
                 data["d"] = msg->data;
@@ -574,6 +627,249 @@ void subscribe_to_sensor(std::string topic, std::vector<ros::Subscriber> &sensor
             ROS_ERROR_STREAM("Invalid Sensor Data Type: " << (int) sensor.value_type);
         }
     }
+}
+
+std::string utc_timestamp_iso8601(const std::chrono::system_clock::time_point &time_point) {
+    const auto time = std::chrono::system_clock::to_time_t(time_point);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        time_point.time_since_epoch()) % 1000;
+    std::tm tm_utc{};
+#if defined(_WIN32)
+    gmtime_s(&tm_utc, &time);
+#else
+    gmtime_r(&time, &tm_utc);
+#endif
+    std::ostringstream out;
+    out << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%S")
+        << '.' << std::setfill('0') << std::setw(3) << milliseconds.count() << 'Z';
+    return out.str();
+}
+
+bool try_parse_utc_timestamp_iso8601(const std::string &timestamp,
+                                     std::chrono::system_clock::time_point &time_point) {
+    if (timestamp.size() < 20) {
+        return false;
+    }
+
+    std::tm tm_utc{};
+    std::istringstream date_part(timestamp.substr(0, 19));
+    date_part >> std::get_time(&tm_utc, "%Y-%m-%dT%H:%M:%S");
+    if (date_part.fail()) {
+        return false;
+    }
+
+    long milliseconds = 0;
+    if (timestamp.size() >= 24 && timestamp[19] == '.') {
+        const std::string milliseconds_part = timestamp.substr(20, 3);
+        if (milliseconds_part.find_first_not_of("0123456789") != std::string::npos) {
+            return false;
+        }
+        milliseconds = std::stol(milliseconds_part);
+    }
+
+#if defined(_WIN32)
+    const std::time_t seconds_since_epoch = _mkgmtime(&tm_utc);
+#else
+    const std::time_t seconds_since_epoch = timegm(&tm_utc);
+#endif
+    if (seconds_since_epoch == static_cast<std::time_t>(-1)) {
+        return false;
+    }
+
+    time_point = std::chrono::system_clock::from_time_t(seconds_since_epoch) +
+                 std::chrono::milliseconds(milliseconds);
+    return true;
+}
+
+void load_statustransition_log_if_needed_locked() {
+    if (statustransition_log_loaded) {
+        return;
+    }
+    statustransition_log_loaded = true;
+    statustransition_log_entries = json::array();
+
+    try {
+        std::ifstream in(statustransition_log_file);
+        if (!in.good()) {
+            return;
+        }
+        json existing = json::parse(in, nullptr, false);
+        if (existing.is_object() && existing.contains("entries") && existing["entries"].is_array()) {
+            statustransition_log_entries = existing["entries"];
+        } else if (existing.is_array()) {
+            statustransition_log_entries = existing;
+        }
+        while (statustransition_log_entries.size() > STATUSTRANSITION_LOG_MAX_ENTRIES) {
+            statustransition_log_entries.erase(statustransition_log_entries.begin());
+        }
+        if (!statustransition_log_entries.empty()) {
+            const auto &latest_entry = statustransition_log_entries.back();
+            if (latest_entry.contains("timestamp") && latest_entry["timestamp"].is_string()) {
+                has_last_statustransition_timestamp = try_parse_utc_timestamp_iso8601(
+                    latest_entry["timestamp"].get<std::string>(),
+                    last_statustransition_timestamp);
+            }
+        }
+    } catch (const std::exception &e) {
+        ROS_WARN_STREAM("Unable to load statustransition log '" << statustransition_log_file
+                        << "': " << e.what());
+        statustransition_log_entries = json::array();
+    }
+}
+
+void persist_statustransition_log_locked() {
+    try {
+        const std::filesystem::path log_path(statustransition_log_file);
+        const auto parent = log_path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+        const auto temp_path = log_path.string() + ".tmp";
+        json root;
+        root["max_entries"] = STATUSTRANSITION_LOG_MAX_ENTRIES;
+        root["entries"] = statustransition_log_entries;
+        {
+            std::ofstream out(temp_path, std::ios::trunc);
+            if (!out.good()) {
+                ROS_WARN_STREAM("Unable to write statustransition log temp file '" << temp_path << "'.");
+                return;
+            }
+            out << root.dump(2) << std::endl;
+        }
+        std::filesystem::rename(temp_path, log_path);
+    } catch (const std::exception &e) {
+        ROS_WARN_STREAM("Unable to persist statustransition log '" << statustransition_log_file
+                        << "': " << e.what());
+    }
+}
+
+std::size_t normalize_statustransition_log_limit(std::size_t requested_limit, std::size_t available_entries) {
+    if (available_entries == 0) {
+        return 0;
+    }
+
+    std::size_t effective_limit = requested_limit;
+    if (effective_limit == 0) {
+        effective_limit = mqtt_statustransition_log_default_limit;
+    }
+    if (effective_limit == 0) {
+        effective_limit = available_entries;
+    }
+
+    effective_limit = std::min(effective_limit, STATUSTRANSITION_LOG_MAX_ENTRIES);
+    effective_limit = std::min(effective_limit, available_entries);
+    return effective_limit;
+}
+
+void publish_statustransition_log(std::size_t requested_limit) {
+    json payload = json::object();
+    {
+        std::lock_guard<std::mutex> lk(statustransition_log_mutex);
+        load_statustransition_log_if_needed_locked();
+
+        json snapshot = statustransition_log_entries;
+        if (!snapshot.empty() && has_last_statustransition_timestamp) {
+            const auto current_timestamp = std::chrono::system_clock::now();
+            const auto active_status_duration = std::chrono::duration<double>(
+                current_timestamp - last_statustransition_timestamp).count();
+            snapshot.back()["duration_seconds"] = std::max(0.0, active_status_duration);
+            snapshot.back()["duration_is_current"] = true;
+        }
+
+        const std::size_t total_entries = snapshot.size();
+        const std::size_t effective_limit = normalize_statustransition_log_limit(requested_limit, total_entries);
+        json selected_entries = json::array();
+        if (effective_limit > 0) {
+            const std::size_t first_index = total_entries - effective_limit;
+            for (std::size_t index = first_index; index < total_entries; ++index) {
+                selected_entries.push_back(snapshot[index]);
+            }
+        }
+
+        payload["total_entries"] = total_entries;
+        payload["returned_entries"] = selected_entries.size();
+        payload["limit"] = effective_limit;
+        payload["entries"] = std::move(selected_entries);
+    }
+
+    // Retained resource payload for status log pages and external consumers.
+    try_publish("statustransition_log/json", payload.dump(2), true);
+}
+
+json current_temperature_snapshot() {
+    json temperatures = json::object();
+    const std::vector<std::string> sensor_ids = {
+        "om_left_esc_temp",
+        "om_right_esc_temp",
+        "om_mow_esc_temp",
+        "om_mow_motor_temp"
+    };
+    std::lock_guard<std::mutex> lk(latest_double_sensor_values_mutex);
+    for (const auto &sensor_id : sensor_ids) {
+        auto it = latest_double_sensor_values.find(sensor_id);
+        if (it != latest_double_sensor_values.end()) {
+            temperatures[sensor_id] = it->second;
+        } else {
+            temperatures[sensor_id] = nullptr;
+        }
+    }
+    return temperatures;
+}
+
+void maybe_append_statustransition_log(const xbot_msgs::RobotState::ConstPtr &msg) {
+    std::lock_guard<std::mutex> lk(statustransition_log_mutex);
+    load_statustransition_log_if_needed_locked();
+
+    const bool is_transition = !has_last_statustransition_key ||
+                               last_statustransition_state != msg->current_state ||
+                               last_statustransition_sub_state != msg->current_sub_state ||
+                               last_statustransition_charging != msg->is_charging ||
+                               last_statustransition_emergency != msg->emergency;
+
+    if (!is_transition) {
+        return;
+    }
+
+    const auto transition_timestamp = std::chrono::system_clock::now();
+    if (!statustransition_log_entries.empty() && has_last_statustransition_timestamp) {
+        const auto previous_status_duration = std::chrono::duration<double>(
+            transition_timestamp - last_statustransition_timestamp).count();
+        statustransition_log_entries.back()["duration_seconds"] =
+            std::max(0.0, previous_status_duration);
+    }
+
+    json entry;
+    entry["timestamp"] = utc_timestamp_iso8601(transition_timestamp);
+    entry["duration_seconds"] = 0.0;
+    entry["state"] = msg->current_state;
+    entry["sub_state"] = msg->current_sub_state;
+    entry["previous_state"] = has_last_statustransition_key ? json(last_statustransition_state) : json(nullptr);
+    entry["previous_sub_state"] = has_last_statustransition_key ? json(last_statustransition_sub_state) : json(nullptr);
+    entry["battery_percentage"] = msg->battery_percentage;
+    entry["gps_percentage"] = msg->gps_percentage;
+    entry["is_charging"] = msg->is_charging;
+    entry["emergency"] = msg->emergency;
+    entry["position"]["x"] = msg->robot_pose.pose.pose.position.x;
+    entry["position"]["y"] = msg->robot_pose.pose.pose.position.y;
+    entry["position"]["heading"] = msg->robot_pose.vehicle_heading;
+    entry["position"]["pos_accuracy"] = msg->robot_pose.position_accuracy;
+    entry["position"]["heading_accuracy"] = msg->robot_pose.orientation_accuracy;
+    entry["position"]["heading_valid"] = msg->robot_pose.orientation_valid;
+    entry["temperatures"] = current_temperature_snapshot();
+
+    statustransition_log_entries.push_back(entry);
+    while (statustransition_log_entries.size() > STATUSTRANSITION_LOG_MAX_ENTRIES) {
+        statustransition_log_entries.erase(statustransition_log_entries.begin());
+    }
+    persist_statustransition_log_locked();
+
+    last_statustransition_state = msg->current_state;
+    last_statustransition_sub_state = msg->current_sub_state;
+    last_statustransition_charging = msg->is_charging;
+    last_statustransition_emergency = msg->emergency;
+    last_statustransition_timestamp = transition_timestamp;
+    has_last_statustransition_timestamp = true;
+    has_last_statustransition_key = true;
 }
 
 void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
@@ -604,6 +900,8 @@ void robot_state_callback(const xbot_msgs::RobotState::ConstPtr &msg) {
     j["pose"]["pos_accuracy"] = msg->robot_pose.position_accuracy;
     j["pose"]["heading_accuracy"] = msg->robot_pose.orientation_accuracy;
     j["pose"]["heading_valid"] = msg->robot_pose.orientation_valid;
+
+    maybe_append_statustransition_log(msg);
 
     try_publish("robot_state/json", j.dump());
     json data;
@@ -1018,6 +1316,20 @@ int main(int argc, char **argv) {
     version_string = paramNh.param("software_version", std::string("UNKNOWN VERSION"));
     if(version_string.empty()) {
         version_string = "UNKNOWN VERSION";
+    }
+
+    statustransition_log_file = paramNh.param("statustransition_log_file", std::string("/data/ros/log_statustransition.json"));
+    const int configured_statustransition_log_mqtt_limit = paramNh.param("statustransition_log_mqtt_default_limit", 20);
+    if (configured_statustransition_log_mqtt_limit <= 0) {
+        mqtt_statustransition_log_default_limit = STATUSTRANSITION_LOG_MAX_ENTRIES;
+    } else {
+        mqtt_statustransition_log_default_limit = std::min<std::size_t>(
+            static_cast<std::size_t>(configured_statustransition_log_mqtt_limit),
+            STATUSTRANSITION_LOG_MAX_ENTRIES);
+    }
+    {
+        std::lock_guard<std::mutex> lk(statustransition_log_mutex);
+        load_statustransition_log_if_needed_locked();
     }
 
     external_mqtt_enable = paramNh.param("external_mqtt_enable", false);

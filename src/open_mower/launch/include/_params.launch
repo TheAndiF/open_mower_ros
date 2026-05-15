@@ -155,6 +155,8 @@
         <param name="xbot_monitoring/external_mqtt_password" value="$(optenv OM_MQTT_PASSWORD)"/>
         <param name="xbot_monitoring/external_mqtt_topic_prefix" value="$(optenv OM_MQTT_TOPIC_PREFIX)"/>
         <param name="xbot_monitoring/software_version" value="$(optenv OM_SOFTWARE_VERSION)"/>
+        <param name="xbot_monitoring/statustransition_log_file" value="$(optenv OM_STATUSTRANSITION_LOG_FILE /data/ros/log_statustransition.json)"/>
+        <param name="xbot_monitoring/statustransition_log_mqtt_default_limit" value="$(optenv OM_STATUSTRANSITION_LOG_MQTT_DEFAULT_LIMIT 20)"/>
 
         <!-- heatmap_generator -->
         <param name="sensor_ids" value="$(optenv OM_HEATMAP_SENSOR_IDS)"/>
