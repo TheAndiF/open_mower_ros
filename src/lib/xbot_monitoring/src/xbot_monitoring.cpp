@@ -849,6 +849,12 @@ void maybe_append_statustransition_log(const xbot_msgs::RobotState::ConstPtr &ms
     entry["gps_percentage"] = msg->gps_percentage;
     entry["is_charging"] = msg->is_charging;
     entry["emergency"] = msg->emergency;
+    {
+        std::lock_guard<std::mutex> timetable_lk(timetable_mutex);
+        entry["automow"] = timetable_auto_mowing_time;
+        entry["automow_id"] = timetable_auto_mow_id;
+    }
+    entry["current_area_id"] = msg->current_area_id;
     entry["position"]["x"] = msg->robot_pose.pose.pose.position.x;
     entry["position"]["y"] = msg->robot_pose.pose.pose.position.y;
     entry["position"]["heading"] = msg->robot_pose.vehicle_heading;
