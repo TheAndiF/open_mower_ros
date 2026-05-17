@@ -223,6 +223,7 @@ void publishStatus() {
   status_msg.sound_module_busy = (last_ll_status.status_bitmask & 0b01000000) != 0;
   status_msg.ui_board_available = (last_ll_status.status_bitmask & 0b10000000) != 0;
   status_msg.mow_enabled = !(target_speed_mow == 0);
+  status_msg.mower_motor_direction = target_speed_mow > 0 ? 1 : (target_speed_mow < 0 ? -1 : 0);
 
   // overwrite emergency with the LL value.
   emergency_low_level = last_ll_status.emergency_bitmask > 0;

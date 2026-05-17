@@ -15,6 +15,8 @@ bool sound_module_available
 bool sound_module_busy
 bool ui_board_available
 bool mow_enabled
+# Requested/active mowing motor direction: -1 = reverse, 0 = stopped, 1 = forward
+int8 mower_motor_direction
 
 # ESC stuff
 uint8   mower_esc_status

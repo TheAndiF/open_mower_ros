@@ -8,9 +8,10 @@ void MowerServiceInterface::Tick() {
   SendMowerEnabled(status_msg_.mow_enabled);
 }
 
-void MowerServiceInterface::SetMowerEnabled(bool enabled) {
+void MowerServiceInterface::SetMowerEnabled(bool enabled, uint8_t direction) {
   SendMowerEnabled(enabled);
   status_msg_.mow_enabled = enabled;
+  status_msg_.mower_motor_direction = enabled ? (direction ? 1 : -1) : 0;
   status_publisher_.publish(status_msg_);
 }
 

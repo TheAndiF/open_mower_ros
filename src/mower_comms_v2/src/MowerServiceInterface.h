@@ -17,7 +17,7 @@ class MowerServiceInterface : public MowerServiceInterfaceBase {
       : MowerServiceInterfaceBase(service_id, ctx), status_publisher_(status_publisher) {
   }
 
-  void SetMowerEnabled(bool enabled);
+  void SetMowerEnabled(bool enabled, uint8_t direction);
 
   void Tick();
 

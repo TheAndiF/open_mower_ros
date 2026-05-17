@@ -816,6 +816,23 @@ json current_temperature_snapshot() {
     return temperatures;
 }
 
+json current_mow_motor_direction_snapshot() {
+    std::lock_guard<std::mutex> lk(latest_double_sensor_values_mutex);
+    auto it = latest_double_sensor_values.find("om_mow_motor_direction");
+    if (it == latest_double_sensor_values.end()) {
+        return nullptr;
+    }
+
+    const double raw_direction = it->second;
+    if (raw_direction > 0.5) {
+        return 1;
+    }
+    if (raw_direction < -0.5) {
+        return -1;
+    }
+    return 0;
+}
+
 void maybe_append_statustransition_log(const xbot_msgs::RobotState::ConstPtr &msg) {
     std::lock_guard<std::mutex> lk(statustransition_log_mutex);
     load_statustransition_log_if_needed_locked();
@@ -862,6 +879,7 @@ void maybe_append_statustransition_log(const xbot_msgs::RobotState::ConstPtr &ms
     entry["position"]["heading_accuracy"] = msg->robot_pose.orientation_accuracy;
     entry["position"]["heading_valid"] = msg->robot_pose.orientation_valid;
     entry["temperatures"] = current_temperature_snapshot();
+    entry["mow_motor_direction"] = current_mow_motor_direction_snapshot();
 
     statustransition_log_entries.push_back(entry);
     while (statustransition_log_entries.size() > STATUSTRANSITION_LOG_MAX_ENTRIES) {
